@@ -1,0 +1,45 @@
+name: One-shot kh.alexeya live probe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/live-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Call live backend for kh.alexeya
+        run: |
+          python - <<'PY'
+          import json
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+
+          url = "https://pulse-checker-702b.onrender.com/v1/collect"
+          payload = json.dumps({"username": "kh.alexeya"}).encode("utf-8")
+          req = Request(
+              url,
+              data=payload,
+              method="POST",
+              headers={
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+                  "User-Agent": "Pulse-live-probe/1.0",
+              },
+          )
+          try:
+              with urlopen(req, timeout=420) as response:
+                  body = response.read().decode("utf-8", "replace")
+                  print("HTTP_STATUS", response.status)
+                  print("RESPONSE_BODY", body)
+          except HTTPError as exc:
+              body = exc.read().decode("utf-8", "replace")
+              print("HTTP_STATUS", exc.code)
+              print("RESPONSE_BODY", body)
+          PY
