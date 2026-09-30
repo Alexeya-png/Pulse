@@ -5,7 +5,7 @@ package.domain = app.localtracker
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json,java
 source.exclude_dirs = tests,tools,.git,.github,.venv,__pycache__,docs,bin
-version = 0.7.0
+version = 0.7.1
 requirements = python3,kivy==2.3.1,sqlite3,pyjnius,certifi,requests==2.34.2
 orientation = portrait
 fullscreen = 0
