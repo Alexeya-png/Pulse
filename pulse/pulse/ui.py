@@ -339,26 +339,42 @@ class PulseApp(App):
         self.message("Собираем данные автоматически. Вход в Instagram не требуется…")
 
         def work():
-            snapshot = collect_snapshot(account)
+            previous_following = self.store.current_members(account, "following")
+            snapshot = collect_snapshot(
+                account,
+                previous_following=previous_following,
+            )
             changes = self.store.ingest(snapshot)
-            return changes
+            return changes, snapshot
 
-        def done(changes):
+        def done(result):
+            changes, snapshot = result
             self.prefs["target"] = account
             self.save_prefs()
             self.cursor, self.page_stack = None, []
             self.refresh()
             summary = self.store.summary(account)
+            reciprocal_ready = self.store.nonreciprocal(account, limit=1)["ready"]
+            reciprocal_text = (
+                f"Не взаимно: {summary['nonreciprocal'] or 0}."
+                if reciprocal_ready
+                else "Не взаимно: — (Instagram скрыл часть подписок)."
+            )
+            reconciled_note = (
+                " Скрытые подписки восстановлены из предыдущего полного снимка."
+                if "local-reconciled" in snapshot.source
+                else ""
+            )
             if changes.baselines and not changes.compared:
                 self.message(
                     f"Первый снимок сохранён. Подписчиков: {summary['followers'] or 0}. "
-                    f"Не взаимно: {summary['nonreciprocal'] or 0}."
+                    f"{reciprocal_text}{reconciled_note}"
                 )
             else:
                 self.message(
                     f"Проверено. Отписались: {summary['latest_unfollowers'] or 0}. "
                     f"Новые: {summary['latest_new_followers'] or 0}. "
-                    f"Не взаимно: {summary['nonreciprocal'] or 0}."
+                    f"{reciprocal_text}{reconciled_note}"
                 )
             self._update_collection_button()
 
