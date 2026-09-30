@@ -46,6 +46,56 @@ class CheckerClientTests(unittest.TestCase):
         post.assert_called_once()
         self.assertEqual(post.call_args.kwargs["json"], {"username": "example"})
 
+    def test_partial_following_is_reconciled_from_complete_local_baseline(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "account": "example",
+            "captured_at": "2026-09-30T00:00:00+00:00",
+            "followers_count": 1,
+            "following_count": 2,
+            "followers": [{"id": "1", "username": "alice"}],
+            "following": [{"id": "2", "username": "bob"}],
+            "followers_complete": True,
+            "following_complete": False,
+            "complete": False,
+            "source": "pulse-direct-server-following-partial",
+        }
+        previous = (Member("bob", "2"), Member("carol", "3"))
+        with patch(
+            "pulse.checker_client.collect_snapshot_direct",
+            side_effect=InstagramDirectError("anonymous unavailable"),
+        ), patch("pulse.checker_client.requests.post", return_value=response):
+            result = collect_snapshot("example", previous_following=previous)
+
+        following = next(sample for sample in result.samples if sample.kind == "following")
+        self.assertEqual({member.user_id for member in following.members}, {"2", "3"})
+        self.assertIn("local-reconciled", result.source)
+
+    def test_partial_following_without_baseline_keeps_followers_only(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "account": "example",
+            "captured_at": "2026-09-30T00:00:00+00:00",
+            "followers_count": 1,
+            "following_count": 2,
+            "followers": [{"id": "1", "username": "alice"}],
+            "following": [{"id": "2", "username": "bob"}],
+            "followers_complete": True,
+            "following_complete": False,
+            "complete": False,
+            "source": "pulse-direct-server-following-partial",
+        }
+        with patch(
+            "pulse.checker_client.collect_snapshot_direct",
+            side_effect=InstagramDirectError("anonymous unavailable"),
+        ), patch("pulse.checker_client.requests.post", return_value=response):
+            result = collect_snapshot("example")
+
+        self.assertEqual([sample.kind for sample in result.samples], ["followers"])
+        self.assertIn("followers-only", result.source)
+
     def test_backend_partial_result_is_rejected(self):
         response = MagicMock()
         response.status_code = 200
