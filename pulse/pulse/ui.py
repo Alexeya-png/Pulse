@@ -196,9 +196,9 @@ class PulseApp(App):
             stats.add_widget(card)
             self.stats.append(value)
         root.add_widget(stats)
-        self.sync_btn = Pill(text="Проверить сейчас", fill=LIME, color=BG, bold=True, size_hint_y=None, height=dp(48), on_release=lambda *_: self.sync())
+        self.sync_btn = Pill(text="Импортировать выгрузку", fill=LIME, color=BG, bold=True, size_hint_y=None, height=dp(48), on_release=lambda *_: self.import_export())
         root.add_widget(self.sync_btn)
-        self.status = label("Нажмите «Проверить сейчас». Если нужно, откроется вход Instagram.", size=12, color=MUTED, height=54)
+        self.status = label("Импортируйте ZIP/JSON выгрузки Instagram.", size=12, color=MUTED, height=54)
         root.add_widget(self.status)
         tabs = BoxLayout(size_hint_y=None, height=dp(37), spacing=dp(6))
         self.tabs = []
@@ -227,7 +227,7 @@ class PulseApp(App):
         pager.add_widget(self.next_btn)
         root.add_widget(pager)
         footer = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(8))
-        self.connect_btn = Pill(text="Войти / сменить аккаунт", on_release=lambda *_: self.login_dialog())
+        self.connect_btn = Pill(text="Импортировать данные", on_release=lambda *_: self.import_export())
         footer.add_widget(self.connect_btn)
         footer.add_widget(Pill(text="Как работает", on_release=lambda *_: self.help_dialog()))
         root.add_widget(footer)
@@ -295,7 +295,7 @@ class PulseApp(App):
         return
 
     def sync(self):
-        self.instagram_check()
+        self.import_export()
 
     def auto_tick(self, _):
         return
@@ -381,78 +381,74 @@ class PulseApp(App):
         content.bind(width=lambda w, width: setattr(w, "text_size", (width, None)))
         return self.modal(title, [content], height=430)
 
-    def instagram_check(self):
-        if self.busy or self.instagram_flow:
+    def import_export(self):
+        if self.busy or self.file_picker:
             return
         if self.demo_mode:
             self.demo_mode = False
             self.store = self.real_store
             self.mode_label.text = "INSTAGRAM"
-
         try:
             account = username(self.target.text)
         except DataError:
-            self.message("Укажите Instagram-ник аккаунта.")
+            self.message("Сначала укажите имя аккаунта.")
             self.target.focus = True
             return
-
         if platform != "android":
-            self.message("Проверка Instagram доступна в Android-приложении.")
+            self.message("Импорт файла доступен в Android-приложении.")
             return
 
         self.target.disabled = self.settings_btn.disabled = self.connect_btn.disabled = True
         self.sync_btn.disabled = True
-        self.message("Открываем Instagram…")
+        self.message("Выберите ZIP или JSON выгрузки Instagram…")
 
         def unlock():
-            self.instagram_flow = None
+            self.file_picker = None
             self.target.disabled = self.settings_btn.disabled = self.connect_btn.disabled = False
             self.sync_btn.disabled = False
 
         def cancelled():
             unlock()
-            self.message("Вход или проверка отменены.")
+            self.message("Импорт отменён.")
 
         def failed(message):
             unlock()
-            self.message(message or "Не удалось проверить Instagram.")
+            self.message(message or "Не удалось открыть файл.")
 
-        def progress(message):
-            self.message(message)
-
-        def selected(path, logged_account):
+        def selected(path):
             unlock()
             captured_at = datetime.now(timezone.utc).isoformat()
 
             def work():
                 snapshot = load_snapshot(path, account, captured_at, export_complete=True)
                 changes = self.store.ingest(snapshot)
-                return changes, snapshot.account
+                return changes, {sample.kind for sample in snapshot.samples}
 
             def done(result):
-                changes, snapshot_account = result
-                self.target.text = snapshot_account
-                self.prefs["target"] = snapshot_account
+                changes, kinds = result
+                self.prefs["target"] = account
                 self.save_prefs()
                 self.cursor, self.page_stack = None, []
                 self.refresh()
                 if changes.baselines and not changes.compared:
-                    text = "Точка отсчёта сохранена. Следующая проверка покажет изменения."
+                    text = "Точка отсчёта сохранена."
                 else:
-                    summary = self.store.summary(snapshot_account)
-                    text = f"Проверено. Отписок: {summary['latest_unfollowers']}. Без ответа: {summary['nonreciprocal'] if summary['nonreciprocal'] is not None else 'нет данных'}."
+                    summary = self.store.summary(account)
+                    text = f"Импортировано. Отписок: {summary['latest_unfollowers']}."
+                if "following" not in kinds:
+                    text += " В выгрузке нет following.json — невзаимные подписки не обновлены."
                 self.message(text)
 
             self.submit(work, done)
 
         try:
-            from .android_instagram import open_instagram_check
-            self.instagram_flow = open_instagram_check(account, selected, cancelled, failed, progress)
+            from .android_import import pick_instagram_export
+            self.file_picker = pick_instagram_export(selected, cancelled, failed)
         except Exception:
-            failed("Не удалось открыть Instagram.")
+            failed("Не удалось открыть выбор файла.")
 
     def login_dialog(self):
-        self.instagram_check()
+        self.import_export()
 
     def settings_dialog(self):
         demo = Pill(text="Выйти из демо" if self.demo_mode else "Посмотреть демо", size_hint_y=None, height=dp(43))
@@ -475,7 +471,7 @@ class PulseApp(App):
     def help_dialog(self):
         self.dialog(
             "Как работает Pulse",
-            "Нажмите «Проверить сейчас». При первом запуске откроется Instagram. Войдите обычным способом. После успешного входа Pulse сам загрузит подписчиков и подписки и вернётся в приложение. Следующие проверки используют сохранённый вход WebView, пока Instagram не попросит войти снова."
+            "Импортируйте ZIP или JSON из выгрузки Instagram. Первый импорт — точка отсчёта. Следующий импорт покажет отписки, новые и невзаимные подписки."
         )
 
     def on_pause(self):
@@ -488,7 +484,5 @@ class PulseApp(App):
 
     def on_stop(self):
         self.stopping = True
-        if self.instagram_flow:
-            self.instagram_flow.close()
         self.pool.shutdown(wait=False, cancel_futures=True)
 
