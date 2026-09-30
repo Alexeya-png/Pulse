@@ -589,6 +589,50 @@ class ApiTests(unittest.TestCase):
                 )
         self.assertEqual(error.exception.status_code, 409)
 
+    def test_coderx_fallback_can_fill_missing_followers(self):
+        exposed = [
+            {"id": str(i), "username": f"user{i}"}
+            for i in range(1, 140)
+        ]
+        missing = [
+            {"id": "140", "username": "user140"},
+            {"id": "141", "username": "user141"},
+            {"id": "142", "username": "user142"},
+        ]
+
+        with patch.object(
+            main,
+            "_collect_full_followers_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_session_actor",
+            return_value=exposed,
+        ), patch.object(
+            main,
+            "_collect_relation_from_actor",
+            return_value=exposed,
+        ), patch.object(
+            main,
+            "_collect_coderx_actor",
+            return_value=missing,
+        ) as independent:
+            result = main._collect_relation(
+                "example",
+                142,
+                "Followers",
+                "Подписчики",
+            )
+
+        self.assertEqual(len(result), 142)
+        self.assertEqual({item["id"] for item in result}, {str(i) for i in range(1, 143)})
+        independent.assert_called_once_with(
+            "example",
+            142,
+            "Followers",
+            "Подписчики",
+        )
+
     def test_collect_profile_requests_followings_plural(self):
         profile = {
             "id": "123",

@@ -1024,7 +1024,7 @@ def _collect_relation(
             if attempt + 1 < APIFY_RELATION_ATTEMPTS and APIFY_RETRY_DELAY:
                 _pause(APIFY_RETRY_DELAY)
 
-    if is_following and APIFY_CODERX_RELATION_ACTOR and len(combined) < expected:
+    if APIFY_CODERX_RELATION_ACTOR and len(combined) < expected:
         try:
             result = _collect_coderx_actor(
                 username,
