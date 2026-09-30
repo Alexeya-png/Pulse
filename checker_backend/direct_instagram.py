@@ -14,6 +14,15 @@ from fastapi import HTTPException
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
 IG_WEB_APP_ID = "936619743392459"
+IG_BROWSER_UA = os.environ.get(
+    "IG_DIRECT_BROWSER_UA",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+)
+IG_APP_UA = os.environ.get(
+    "IG_DIRECT_APP_UA",
+    "Instagram 389.0.0.49.87 Android (34/14; 420dpi; 1080x2400; Google/google; Pixel 7; panther; panther; en_US; 699134704)",
+)
 IG_REQUEST_DELAY = max(0.0, float(os.environ.get("IG_DIRECT_REQUEST_DELAY", "0.8")))
 IG_429_RETRIES = max(0, int(os.environ.get("IG_DIRECT_429_RETRIES", "1")))
 IG_429_BACKOFF = max(0.5, float(os.environ.get("IG_DIRECT_429_BACKOFF", "2.0")))
@@ -74,21 +83,60 @@ def _session_data() -> dict[str, str]:
     return data
 
 
-def _make_session() -> requests.Session:
-    data = _session_data()
-    session = requests.Session()
-    session.headers.update({
+def _session_headers(user_agent: str) -> dict[str, str]:
+    return {
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "User-Agent": "Instagram 123.0.0.21.114",
+        "User-Agent": user_agent,
         "X-IG-App-ID": IG_WEB_APP_ID,
         "X-Requested-With": "XMLHttpRequest",
         "Referer": "https://www.instagram.com/",
-    })
+    }
+
+
+def _apply_cookies(
+    session: requests.Session,
+    data: dict[str, str],
+    *,
+    minimal: bool = False,
+) -> None:
+    allowed = {"sessionid", "csrftoken", "ds_user_id", "mid", "ig_did", "rur"}
     for name, value in data.items():
+        if minimal and name not in allowed:
+            continue
         session.cookies.set(name, value, domain=".instagram.com", path="/")
+    csrf = data.get("csrftoken")
+    if csrf:
+        session.headers["X-CSRFToken"] = csrf
+
+
+def _make_session() -> requests.Session:
+    data = _session_data()
+    session = requests.Session()
+    session.headers.update(_session_headers(IG_BROWSER_UA))
+    _apply_cookies(session, data)
     return session
 
+
+def _fallback_sessions(source: requests.Session) -> list[tuple[str, requests.Session]]:
+    cookies = requests.utils.dict_from_cookiejar(source.cookies)
+    variants: list[tuple[str, requests.Session]] = []
+
+    minimal = requests.Session()
+    minimal.headers.update(_session_headers(IG_BROWSER_UA))
+    _apply_cookies(minimal, cookies, minimal=True)
+    variants.append(("minimal-browser", minimal))
+
+    mobile = requests.Session()
+    mobile.headers.update(_session_headers(IG_APP_UA))
+    _apply_cookies(mobile, cookies, minimal=True)
+    variants.append(("mobile-auth", mobile))
+
+    anonymous = requests.Session()
+    anonymous.headers.update(_session_headers(IG_BROWSER_UA))
+    variants.append(("anonymous-browser", anonymous))
+
+    return variants
 
 def _pace(deadline: float) -> None:
     global _last_request_at
@@ -103,52 +151,87 @@ def _pace(deadline: float) -> None:
         _last_request_at = time.monotonic()
 
 
-def _json_get(
+def _fetch_once(
     session: requests.Session,
     url: str,
     params: dict | None,
     deadline: float,
 ) -> tuple[int, dict | None]:
-    response = None
-    for attempt in range(IG_429_RETRIES + 1):
-        _pace(deadline)
-        remaining = _remaining(deadline)
-        try:
-            response = session.get(
-                url,
-                params=params,
-                timeout=(min(8.0, remaining), min(30.0, remaining)),
-                allow_redirects=True,
-            )
-        except requests.RequestException:
-            raise HTTPException(502, "Instagram временно недоступен для прямого collector.") from None
+    _pace(deadline)
+    remaining = _remaining(deadline)
+    try:
+        response = session.get(
+            url,
+            params=params,
+            timeout=(min(8.0, remaining), min(30.0, remaining)),
+            allow_redirects=True,
+        )
+    except requests.RequestException:
+        raise HTTPException(502, "Instagram временно недоступен для прямого collector.") from None
 
-        final_url = response.url.lower()
-        if "/challenge/" in final_url or "/checkpoint/" in final_url:
-            raise HTTPException(503, "Instagram просит подтвердить checker-аккаунт.")
-        if "/accounts/login" in final_url:
-            raise HTTPException(503, "IG_SESSION_JSON checker-аккаунта истёк.")
+    final_url = response.url.lower()
+    if "/challenge/" in final_url or "/checkpoint/" in final_url:
+        raise HTTPException(503, "Instagram просит подтвердить checker-аккаунт.")
+    if "/accounts/login" in final_url:
+        return 401, None
 
-        if response.status_code != 429:
-            break
-        if attempt >= IG_429_RETRIES:
-            logger.warning("Direct Instagram fallback remained rate-limited")
-            raise HTTPException(
-                503,
-                "Instagram ограничил прямые запросы с сервера. Снимок не сохранён.",
-            )
-        delay = min(IG_429_BACKOFF * (2 ** attempt), IG_MAX_RETRY_AFTER, _remaining(deadline))
-        logger.warning("Direct Instagram fallback rate-limited; retrying once")
-        time.sleep(delay)
-
-    if response is None:
-        raise HTTPException(502, "Instagram не вернул ответ.")
     try:
         data = response.json()
     except ValueError:
         data = None
     return response.status_code, data if isinstance(data, dict) else None
 
+
+def _json_get(
+    session: requests.Session,
+    url: str,
+    params: dict | None,
+    deadline: float,
+) -> tuple[int, dict | None]:
+    status = 503
+    data = None
+    for attempt in range(IG_429_RETRIES + 1):
+        status, data = _fetch_once(session, url, params, deadline)
+        if status != 429:
+            break
+        if attempt >= IG_429_RETRIES:
+            break
+        delay = min(
+            IG_429_BACKOFF * (2 ** attempt),
+            IG_MAX_RETRY_AFTER,
+            _remaining(deadline),
+        )
+        logger.warning("Direct Instagram transport rate-limited; retrying")
+        time.sleep(delay)
+
+    if status not in (401, 403, 429):
+        return status, data
+
+    best_status, best_data = status, data
+    for name, alternative in _fallback_sessions(session):
+        try:
+            alt_status, alt_data = _fetch_once(alternative, url, params, deadline)
+        finally:
+            alternative.close()
+
+        if alt_status not in (401, 403, 429):
+            logger.info(
+                "Direct Instagram transport recovered via %s (HTTP %d)",
+                name,
+                alt_status,
+            )
+            return alt_status, alt_data
+        if best_status == 429 and alt_status != 429:
+            best_status, best_data = alt_status, alt_data
+
+    if best_status == 429:
+        logger.warning("Direct Instagram fallback remained rate-limited on all transports")
+        raise HTTPException(
+            503,
+            "Instagram ограничил прямые запросы с сервера. Снимок не сохранён.",
+        )
+
+    return best_status, best_data
 
 def _as_int(value) -> int | None:
     try:
