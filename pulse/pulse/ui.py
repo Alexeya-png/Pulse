@@ -331,7 +331,7 @@ class PulseApp(App):
             self.prefs["export_pending"] = True
             self.save_prefs()
             self._update_collection_button()
-            self.message("В Instagram выберите Followers and following → JSON → All time. Когда ZIP будет готов и скачан, вернитесь в Pulse и нажмите эту же кнопку.")
+            self.message("В Instagram выберите Followers and following → JSON → All time. После скачивания ZIP просто вернитесь в Pulse — выбор файла откроется автоматически.")
             open_instagram_export()
         except Exception:
             self.prefs["export_pending"] = False
@@ -522,7 +522,7 @@ class PulseApp(App):
             "Как работает Pulse",
             "1. Нажмите «Собрать данные». Pulse откроет официальный экспорт Instagram.\n\n"
             "2. Выберите Followers and following, JSON и All time. Скачайте готовый ZIP.\n\n"
-            "3. Вернитесь в Pulse и нажмите ту же кнопку, затем выберите ZIP. Первый сбор станет точкой отсчёта.\n\n"
+            "3. После скачивания ZIP вернитесь в Pulse. Выбор файла откроется автоматически — выберите ZIP. Первый сбор станет точкой отсчёта.\n\n"
             "4. Позже нажмите «Собрать снова и проверить», получите новый ZIP и выберите его. Pulse сравнит два сбора и покажет отписки, новых и невзаимные подписки."
         )
 
@@ -533,9 +533,10 @@ class PulseApp(App):
 
     def on_resume(self):
         self.paused = False
-        if self.prefs.get("export_pending"):
+        if self.prefs.get("export_pending") and not self.busy and not self.file_picker:
             self._update_collection_button()
-            self.message("Если ZIP уже готов и скачан, нажмите «Выбрать готовый ZIP».")
+            self.message("Выберите скачанный ZIP Instagram.")
+            Clock.schedule_once(lambda _: self.import_export(), 0.6)
 
     def on_stop(self):
         self.stopping = True
