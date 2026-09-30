@@ -12,7 +12,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Pulse Checker", version="0.5.4")
+app = FastAPI(title="Pulse Checker", version="0.5.5")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -32,6 +32,14 @@ APIFY_RELATION_FALLBACK_ACTOR = os.environ.get(
 APIFY_SESSION_ACTOR = os.environ.get(
     "APIFY_SESSION_ACTOR",
     "dami_studio~instagram-followers-following-scraper",
+)
+APIFY_FULL_FOLLOWING_ACTOR = os.environ.get(
+    "APIFY_FULL_FOLLOWING_ACTOR",
+    "thenetaji~instagram-followers-followings-scraper",
+)
+APIFY_FREE_FOLLOWING_ACTOR = os.environ.get(
+    "APIFY_FREE_FOLLOWING_ACTOR",
+    "publicsignallabs~instagram-following",
 )
 APIFY_OFFICIAL_RELATION_ACTOR = os.environ.get(
     "APIFY_OFFICIAL_RELATION_ACTOR",
@@ -319,7 +327,12 @@ def _member(row: dict, username: str, data_type: str) -> dict:
     if not isinstance(row, dict):
         raise HTTPException(502, "Онлайн-collector вернул некорректный элемент списка.")
 
-    source = str(row.get("username_scrape") or row.get("sourceUsername") or "").strip().lower()
+    source = str(
+        row.get("username_scrape")
+        or row.get("sourceUsername")
+        or row.get("source_username")
+        or ""
+    ).strip().lower()
     if source and source != username:
         raise HTTPException(502, "Онлайн-collector смешал данные разных аккаунтов.")
 
@@ -422,6 +435,107 @@ def _collect_session_actor(
         )
     logger.info(
         "Apify session actor returned %d/%d for %s",
+        len(found),
+        expected,
+        label,
+    )
+    return list(found.values())
+
+
+def _collect_full_following_actor(
+    username: str,
+    expected: int,
+    label: str,
+) -> list[dict]:
+    run = _start_actor(
+        APIFY_FULL_FOLLOWING_ACTOR,
+        {
+            "username": [username],
+            "type": "followings",
+            "maxItem": expected,
+            "enrichProfile": False,
+            "fullProfileDetails": False,
+        },
+    )
+    run = _wait_run(str(run["id"]))
+    dataset_id = run.get("defaultDatasetId")
+    if not dataset_id:
+        raise HTTPException(
+            502,
+            f"{label}: full-provider не создал результат.",
+        )
+
+    rows = _dataset_items(str(dataset_id))
+    found: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("cursor") is not None and not row.get("username"):
+            continue
+        member = _member(row, username, "Followings")
+        found[member["id"]] = member
+        if len(found) > expected:
+            raise HTTPException(
+                409,
+                f"{label}: список изменился во время проверки. Снимок не сохранён.",
+            )
+
+    logger.info(
+        "Apify full following actor returned %d/%d for %s",
+        len(found),
+        expected,
+        label,
+    )
+    return list(found.values())
+
+
+def _collect_free_following_actor(
+    username: str,
+    expected: int,
+    label: str,
+) -> list[dict]:
+    if expected > 1000:
+        return []
+
+    run = _start_actor(
+        APIFY_FREE_FOLLOWING_ACTOR,
+        {
+            "Account": [username],
+            "resultsLimit": max(25, expected),
+        },
+    )
+    run = _wait_run(str(run["id"]))
+    dataset_id = run.get("defaultDatasetId")
+    if not dataset_id:
+        raise HTTPException(
+            502,
+            f"{label}: free-provider не создал результат.",
+        )
+
+    rows = _dataset_items(str(dataset_id))
+    found: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        member = _member(row, username, "Followings")
+        found[member["id"]] = member
+        if len(found) > expected:
+            raise HTTPException(
+                409,
+                f"{label}: список изменился во время проверки. Снимок не сохранён.",
+            )
+
+    output = _run_output(str(run["id"]))
+    outcome = str(output.get("outcome") or "").upper()
+    if outcome and outcome not in {"COMPLETED", "NO_RESULTS"}:
+        logger.warning(
+            "Apify free following actor outcome for %s: %s",
+            label,
+            outcome[:64],
+        )
+
+    logger.info(
+        "Apify free following actor returned %d/%d for %s",
         len(found),
         expected,
         label,
@@ -583,6 +697,60 @@ def _collect_relation(
     combined: dict[str, dict] = {}
     normalized_type = data_type.strip().lower()
     is_following = normalized_type in {"following", "followings"}
+
+    if is_following and APIFY_FULL_FOLLOWING_ACTOR:
+        try:
+            result = _collect_full_following_actor(
+                username,
+                expected,
+                label,
+            )
+        except HTTPException as exc:
+            if exc.status_code in (401, 403, 429):
+                raise
+            logger.warning(
+                "Apify full following actor failed for %s (%d)",
+                label,
+                exc.status_code,
+            )
+            result = []
+
+        for member in result:
+            combined[member["id"]] = member
+        if len(combined) > expected:
+            raise HTTPException(
+                409,
+                f"{label}: данные изменились во время сбора. Снимок не сохранён.",
+            )
+        if len(combined) == expected:
+            return list(combined.values())
+
+    if is_following and APIFY_FREE_FOLLOWING_ACTOR and expected <= 1000:
+        try:
+            result = _collect_free_following_actor(
+                username,
+                expected,
+                label,
+            )
+        except HTTPException as exc:
+            if exc.status_code in (401, 403, 429):
+                raise
+            logger.warning(
+                "Apify free following actor failed for %s (%d)",
+                label,
+                exc.status_code,
+            )
+            result = []
+
+        for member in result:
+            combined[member["id"]] = member
+        if len(combined) > expected:
+            raise HTTPException(
+                409,
+                f"{label}: данные изменились во время сбора. Снимок не сохранён.",
+            )
+        if len(combined) == expected:
+            return list(combined.values())
 
     if is_following and APIFY_OFFICIAL_RELATION_ACTOR:
         try:

@@ -213,6 +213,70 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(result, [{"id": "1", "username": "alice"}])
         self.assertNotIn("sessionCookies", captured["body"])
 
+    def test_full_following_actor_uses_full_schema(self):
+        run = {"id": "r1", "defaultDatasetId": "d1"}
+        rows = [{
+            "source_username": "example",
+            "id": "1",
+            "username": "Alice",
+        }]
+        captured = {}
+
+        def start(actor, body):
+            captured["actor"] = actor
+            captured["body"] = body
+            return run
+
+        with patch.object(main, "_start_actor", side_effect=start), \
+                patch.object(main, "_wait_run", return_value=run), \
+                patch.object(main, "_dataset_items", return_value=rows):
+            result = main._collect_full_following_actor(
+                "example",
+                1,
+                "Подписки",
+            )
+
+        self.assertEqual(result, [{"id": "1", "username": "alice"}])
+        self.assertEqual(captured["actor"], main.APIFY_FULL_FOLLOWING_ACTOR)
+        self.assertEqual(captured["body"], {
+            "username": ["example"],
+            "type": "followings",
+            "maxItem": 1,
+            "enrichProfile": False,
+            "fullProfileDetails": False,
+        })
+
+    def test_free_following_actor_uses_free_schema(self):
+        run = {"id": "r1", "defaultDatasetId": "d1"}
+        rows = [{
+            "username_scrape": "example",
+            "id": "1",
+            "username": "Alice",
+        }]
+        captured = {}
+
+        def start(actor, body):
+            captured["actor"] = actor
+            captured["body"] = body
+            return run
+
+        with patch.object(main, "_start_actor", side_effect=start), \
+                patch.object(main, "_wait_run", return_value=run), \
+                patch.object(main, "_dataset_items", return_value=rows), \
+                patch.object(main, "_run_output", return_value={"outcome": "COMPLETED"}):
+            result = main._collect_free_following_actor(
+                "example",
+                1,
+                "Подписки",
+            )
+
+        self.assertEqual(result, [{"id": "1", "username": "alice"}])
+        self.assertEqual(captured["actor"], main.APIFY_FREE_FOLLOWING_ACTOR)
+        self.assertEqual(captured["body"], {
+            "Account": ["example"],
+            "resultsLimit": 25,
+        })
+
     def test_official_actor_following_uses_public_schema(self):
         run = {"id": "r1", "defaultDatasetId": "d1"}
         rows = [{
@@ -246,22 +310,25 @@ class ApiTests(unittest.TestCase):
             "resultsLimit": 1,
         })
 
-    def test_following_uses_public_provider_first(self):
-        public_rows = [
+    def test_following_uses_full_provider_first(self):
+        full_rows = [
             {"id": "1", "username": "alice"},
             {"id": "2", "username": "bob"},
         ]
         with patch.object(
             main,
+            "_collect_full_following_actor",
+            return_value=full_rows,
+        ) as full_collect, patch.object(
+            main,
+            "_collect_free_following_actor",
+        ) as free_collect, patch.object(
+            main,
             "_collect_official_actor",
-            return_value=public_rows,
         ) as public_collect, patch.object(
             main,
             "_collect_session_actor",
-        ) as session_collect, patch.object(
-            main,
-            "_collect_relation_from_actor",
-        ) as fallback_collect:
+        ) as session_collect:
             result = main._collect_relation(
                 "example",
                 2,
@@ -270,14 +337,14 @@ class ApiTests(unittest.TestCase):
             )
 
         self.assertEqual(len(result), 2)
-        public_collect.assert_called_once_with(
+        full_collect.assert_called_once_with(
             "example",
             2,
-            "Followings",
             "Подписки",
         )
+        free_collect.assert_not_called()
+        public_collect.assert_not_called()
         session_collect.assert_not_called()
-        fallback_collect.assert_not_called()
 
 
     def test_relation_retries_merge_unique_ids(self):
@@ -328,6 +395,14 @@ class ApiTests(unittest.TestCase):
         ]
         with patch.object(
             main,
+            "_collect_full_following_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_free_following_actor",
+            return_value=[],
+        ), patch.object(
+            main,
             "_collect_official_actor",
             return_value=exposed,
         ), patch.object(
@@ -350,6 +425,14 @@ class ApiTests(unittest.TestCase):
             for i in range(1, 109)
         ]
         with patch.object(
+            main,
+            "_collect_full_following_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_free_following_actor",
+            return_value=[],
+        ), patch.object(
             main,
             "_collect_official_actor",
             return_value=exposed,
