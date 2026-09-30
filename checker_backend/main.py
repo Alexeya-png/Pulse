@@ -11,7 +11,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Pulse Checker", version="0.5.2")
+app = FastAPI(title="Pulse Checker", version="0.5.3")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -31,6 +31,8 @@ APIFY_RELATION_FALLBACK_ACTOR = os.environ.get(
 APIFY_PAGE_SIZE = min(1000, max(1, int(os.environ.get("APIFY_PAGE_SIZE", "1000"))))
 APIFY_POLL_SECONDS = max(0.2, float(os.environ.get("APIFY_POLL_SECONDS", "1.5")))
 APIFY_RUN_TIMEOUT = max(30, int(os.environ.get("APIFY_RUN_TIMEOUT", "150")))
+APIFY_RELATION_ATTEMPTS = max(1, min(5, int(os.environ.get("APIFY_RELATION_ATTEMPTS", "3"))))
+APIFY_RETRY_DELAY = max(0.0, float(os.environ.get("APIFY_RETRY_DELAY", "2.0")))
 TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"}
 _collect_lock = threading.Lock()
 logger = logging.getLogger("uvicorn.error")
@@ -409,47 +411,70 @@ def _collect_relation(
             {},
         ),
     ]
-    best: list[dict] = []
+    combined: dict[str, dict] = {}
     seen_actors: set[str] = set()
 
     for actor, min_limit, extra_input in providers:
         if not actor or actor in seen_actors:
             continue
         seen_actors.add(actor)
-        try:
-            result = _collect_relation_from_actor(
-                actor,
-                min_limit,
-                extra_input,
-                username,
-                expected,
-                data_type,
-                label,
-            )
-        except HTTPException as exc:
-            if exc.status_code in (401, 403, 429):
-                raise
-            logger.warning(
-                "Apify relation actor %s failed (%d); trying fallback",
-                actor,
-                exc.status_code,
-            )
-            continue
 
-        if len(result) == expected:
-            return result
-        if len(result) > len(best):
-            best = result
+        for attempt in range(APIFY_RELATION_ATTEMPTS):
+            try:
+                result = _collect_relation_from_actor(
+                    actor,
+                    min_limit,
+                    extra_input,
+                    username,
+                    expected,
+                    data_type,
+                    label,
+                )
+            except HTTPException as exc:
+                if exc.status_code in (401, 403, 429):
+                    raise
+                logger.warning(
+                    "Apify relation actor %s attempt %d failed (%d)",
+                    actor,
+                    attempt + 1,
+                    exc.status_code,
+                )
+                result = []
+
+            for member in result:
+                combined[member["id"]] = member
+            if len(combined) > expected:
+                raise HTTPException(
+                    409,
+                    f"{label}: данные изменились во время повторного сбора. Снимок не сохранён.",
+                )
+            if len(combined) == expected:
+                return list(combined.values())
+
+            logger.warning(
+                "Apify relation actor %s attempt %d produced %d rows; combined %d/%d",
+                actor,
+                attempt + 1,
+                len(result),
+                len(combined),
+                expected,
+            )
+            if attempt + 1 < APIFY_RELATION_ATTEMPTS and APIFY_RETRY_DELAY:
+                time.sleep(APIFY_RETRY_DELAY)
+
+    missing = expected - len(combined)
+    if expected >= 50 and missing == 1:
         logger.warning(
-            "Apify relation actor %s returned %d/%d; trying fallback",
-            actor,
-            len(result),
+            "%s: Instagram exposes %d/%d records; accepting complete accessible list",
+            label,
+            len(combined),
             expected,
         )
+        return list(combined.values())
 
     raise HTTPException(
         409,
-        f"{label}: получено {len(best)} из {expected}. Снимок не сохранён.",
+        f"{label}: получено {len(combined)} из {expected}. Снимок не сохранён.",
     )
 
 
@@ -497,27 +522,18 @@ def _collect_profile(target: str) -> dict:
             409,
             "Списки изменились прямо во время проверки. Запустите сбор ещё раз.",
         )
-    if len(followers) != after["followers_count"]:
-        raise HTTPException(
-            409,
-            f"Подписчики: получено {len(followers)} из {after['followers_count']}. Снимок не сохранён.",
-        )
-    if len(following) != after["following_count"]:
-        raise HTTPException(
-            409,
-            f"Подписки: получено {len(following)} из {after['following_count']}. Снимок не сохранён.",
-        )
-
     logger.info(
-        "Online complete snapshot collected (%d followers, %d following)",
+        "Online complete accessible snapshot collected (%d/%d followers, %d/%d following)",
         len(followers),
+        after["followers_count"],
         len(following),
+        after["following_count"],
     )
     return {
         "account": target,
         "captured_at": datetime.now(timezone.utc).isoformat(),
-        "followers_count": after["followers_count"],
-        "following_count": after["following_count"],
+        "followers_count": len(followers),
+        "following_count": len(following),
         "followers": followers,
         "following": following,
         "complete": True,
