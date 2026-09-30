@@ -196,9 +196,9 @@ class PulseApp(App):
             stats.add_widget(card)
             self.stats.append(value)
         root.add_widget(stats)
-        self.sync_btn = Pill(text="Импортировать выгрузку", fill=LIME, color=BG, bold=True, size_hint_y=None, height=dp(48), on_release=lambda *_: self.import_export())
+        self.sync_btn = Pill(text="Войти через Instagram", fill=LIME, color=BG, bold=True, size_hint_y=None, height=dp(48), on_release=lambda *_: self.oauth_login())
         root.add_widget(self.sync_btn)
-        self.status = label("Импортируйте ZIP/JSON выгрузки Instagram.", size=12, color=MUTED, height=54)
+        self.status = label("Официальное подключение Instagram.", size=12, color=MUTED, height=54)
         root.add_widget(self.status)
         tabs = BoxLayout(size_hint_y=None, height=dp(37), spacing=dp(6))
         self.tabs = []
@@ -227,7 +227,7 @@ class PulseApp(App):
         pager.add_widget(self.next_btn)
         root.add_widget(pager)
         footer = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(8))
-        self.connect_btn = Pill(text="Импортировать данные", on_release=lambda *_: self.import_export())
+        self.connect_btn = Pill(text="Войти через Instagram", on_release=lambda *_: self.oauth_login())
         footer.add_widget(self.connect_btn)
         footer.add_widget(Pill(text="Как работает", on_release=lambda *_: self.help_dialog()))
         root.add_widget(footer)
@@ -285,20 +285,96 @@ class PulseApp(App):
                 self.message(str(exc))
                 return
             except Exception:
-                self.message("Не удалось импортировать выгрузку.")
+                self.message("Операция не выполнена.")
                 return
             done(value)
 
         future.add_done_callback(lambda _: Clock.schedule_once(complete))
 
-    def restore_session(self):
-        return
+    def oauth_restore(self):
+        session_id = self.prefs.get("oauth_session")
+        if not session_id or not oauth_configured():
+            if not oauth_configured():
+                self.message("OAuth-клиент подготовлен. Укажите HTTPS-адрес backend в oauth_config.py.")
+            return
+
+        def work():
+            return oauth_fetch_profile(session_id)
+
+        def done(data):
+            self._oauth_connected(session_id, data)
+
+        self.submit(work, done)
 
     def sync(self):
-        self.import_export()
+        self.oauth_login()
 
     def auto_tick(self, _):
         return
+
+    def oauth_login(self):
+        if self.busy:
+            return
+        if platform != "android":
+            self.message("Официальный вход Instagram доступен в Android APK.")
+            return
+        if not oauth_configured():
+            self.message("OAuth ещё не настроен: нужен HTTPS backend и Meta App ID/Secret.")
+            return
+        try:
+            oauth_start_login()
+            self.message("Открыт официальный вход Instagram…")
+        except OAuthConfigError as exc:
+            self.message(str(exc))
+        except Exception:
+            self.message("Не удалось открыть страницу входа Instagram.")
+
+    def oauth_tick(self, _=None):
+        if platform != "android" or self.busy:
+            return
+        try:
+            session_id = oauth_consume_callback()
+        except Exception as exc:
+            self.message(str(exc) or "Instagram не завершил вход.")
+            return
+        if not session_id:
+            return
+
+        self.prefs["oauth_session"] = session_id
+        self.save_prefs()
+
+        def work():
+            return oauth_fetch_profile(session_id)
+
+        def done(data):
+            self._oauth_connected(session_id, data)
+
+        self.submit(work, done)
+
+    def _oauth_connected(self, session_id, data):
+        profile = data.get("profile") or {}
+        account = str(profile.get("username") or "").strip().lower()
+        account_type = str(profile.get("account_type") or "Professional")
+        if account:
+            self.target.text = account
+            self.prefs.update(oauth_session=session_id, target=account)
+            self.save_prefs()
+        self.oauth_session = session_id
+        self.oauth_profile = profile
+        self.connect_btn.text = "Instagram подключён"
+        self.sync_btn.text = "Войти другим аккаунтом"
+        for button, _ in self.tabs:
+            button.disabled = True
+        self.history_btn.disabled = True
+        self.prev_btn.disabled = True
+        self.next_btn.disabled = True
+        self.rv.data = [{
+            "title": "@" + (account or "instagram"),
+            "detail": f"Официальный OAuth · {account_type}",
+            "badge": "✓",
+            "tint": LIME,
+        }]
+        self.message("Instagram подключён официально. Полные списки подписчиков/подписок этот API не предоставляет.")
 
     def refresh(self):
         if not hasattr(self, "rv"):
@@ -448,7 +524,7 @@ class PulseApp(App):
             failed("Не удалось открыть выбор файла.")
 
     def login_dialog(self):
-        self.import_export()
+        self.oauth_login()
 
     def settings_dialog(self):
         demo = Pill(text="Выйти из демо" if self.demo_mode else "Посмотреть демо", size_hint_y=None, height=dp(43))
@@ -471,7 +547,7 @@ class PulseApp(App):
     def help_dialog(self):
         self.dialog(
             "Как работает Pulse",
-            "Импортируйте ZIP или JSON из выгрузки Instagram. Первый импорт — точка отсчёта. Следующий импорт покажет отписки, новые и невзаимные подписки."
+            "Нажмите «Войти через Instagram». Откроется официальный Instagram OAuth. После подтверждения вы автоматически вернётесь в Pulse.\n\nОфициальный Instagram API работает с профессиональными аккаунтами Business/Creator. Он подтверждает аккаунт и даёт разрешённые данные профиля, но не предоставляет полный список подписчиков и подписок, поэтому автоматические «Отписки / Новые / Не взаимно» в официальном режиме недоступны."
         )
 
     def on_pause(self):
@@ -481,6 +557,7 @@ class PulseApp(App):
 
     def on_resume(self):
         self.paused = False
+        self.oauth_tick()
 
     def on_stop(self):
         self.stopping = True
