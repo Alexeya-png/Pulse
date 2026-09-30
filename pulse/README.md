@@ -1,4 +1,4 @@
-# Pulse 0.7.2 — no-login Instagram tracker
+# Pulse 0.7.3 — no-login Instagram tracker
 
 Pulse never asks the app user to sign in to Instagram. There is no Instagram WebView,
 password field, cookie import, or saved user Instagram session.
@@ -11,15 +11,17 @@ password field, cookie import, or saved user Instagram session.
    scraper Actors are not part of the normal path.
 4. The followers list is strict: it is saved only when its length exactly matches the
    Instagram profile counter. This prevents false follow/unfollow events.
-5. Instagram can hide some following accounts from the technical checker identity. For
-   example, kh.alexeya currently reports 114 following while that checker can see 110.
-   This no longer blocks follower tracking.
-6. If the phone already has a previous complete following snapshot of the same expected
-   size, Pulse can carry forward only the IDs that are hidden now, but only when every
-   currently visible ID already existed in that full baseline. If a new visible ID makes
-   the result ambiguous, Pulse does not guess.
-7. When safe reconciliation is impossible, Pulse saves the complete followers sample and
-   temporarily disables the non-reciprocal calculation instead of inventing missing users.
+5. Instagram can hide some following accounts from the technical checker identity.
+   The app stores only the currently observed IDs, with completeness and the exact
+   expected count. It never copies hidden IDs from an older snapshot.
+6. Confirmed non-reciprocal accounts are the observed following IDs minus the complete
+   followers list from the same capture. This works on the first capture and when only
+   part of the following list is available. The UI marks the count with `+` and reports
+   how many following accounts remain unknown. An empty partial result never means
+   that everyone follows back.
+7. Unfollowers and new followers compare two complete followers snapshots by numeric
+   ID. The first capture is a baseline; incomplete followers never overwrite it or
+   create events. No changes on a later capture means no new events; history is kept.
 
 The app user only enters an Instagram username and taps **Собрать данные**.
 
@@ -28,6 +30,10 @@ The app user only enters an Instagram username and taps **Собрать дан�
 Snapshots and comparison history remain in the app-private SQLite database. A stale
 `instagram_session` value from Pulse 0.7.0 is deleted automatically. Android backup is
 disabled.
+
+SQLite schema 2 preserves existing followers and event history. Following lists that
+0.7.2 marked `local-reconciled` are excluded from current reciprocal results until a
+fresh collection replaces them. Older app versions cannot open the new schema.
 
 Comparison uses stable numeric Instagram IDs. Username changes alone are not treated as
 unfollows.

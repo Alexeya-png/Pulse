@@ -71,6 +71,8 @@ class Sample:
     subject: str
     members: tuple[Member, ...]
     identity: str = "username"
+    complete: bool = True
+    expected_count: int | None = None
 
     def __post_init__(self):
         if self.kind not in {"followers", "following", "likes"} or self.identity not in {"username", "id"}:
@@ -83,6 +85,18 @@ class Sample:
             raise DataError("В одном списке все пользователи должны использовать один тип идентификатора.")
         if len({m.key for m in self.members}) != len(self.members):
             raise DataError("В списке повторяются идентификаторы пользователей.")
+        if not isinstance(self.complete, bool):
+            raise DataError("Некорректный признак полноты списка.")
+        expected = self.expected_count
+        if expected is None and self.complete:
+            expected = len(self.members)
+            object.__setattr__(self, "expected_count", expected)
+        if type(expected) is not int or expected < len(self.members):
+            raise DataError("Количество пользователей не совпало со счётчиком.")
+        if self.complete and expected != len(self.members):
+            raise DataError("Полный список не совпал со счётчиком.")
+        if not self.complete and (self.kind != "following" or expected <= len(self.members)):
+            raise DataError("Неполными могут быть только подписки с известным числом скрытых аккаунтов.")
 
 
 @dataclass(frozen=True, slots=True)

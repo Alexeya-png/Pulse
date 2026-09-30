@@ -1,6 +1,6 @@
 # Pulse checker backend
 
-The backend is the no-login fallback for Pulse 0.7.2:
+The backend is the no-login fallback for Pulse:
 
 Android APK -> Pulse backend -> direct Instagram collector.
 
@@ -23,9 +23,10 @@ The profile counters are resolved before collection and rechecked afterwards.
 - `following` may be identity-filtered by Instagram. In that case the API returns the
   visible list with `following_complete: false`, `complete: false`, and the exact
   `following_count`.
-- The Android app may reconcile hidden following IDs only from its own previous complete
-  local following snapshot under strict subset/count checks. Otherwise it stores only the
-  complete followers sample and disables non-reciprocal results for that capture.
+- Android 0.7.3 stores the currently observed following IDs with coverage metadata.
+  It shows confirmed non-reciprocal accounts against the complete followers from that
+  same capture, and separately reports the number of unavailable following accounts.
+  It never fills missing IDs from an older snapshot.
 
 Response fields include `followers_complete` and `following_complete` in addition to
 the existing counters, member arrays, `complete`, and `source`.

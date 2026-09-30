@@ -31,36 +31,10 @@ def _parse_members(raw: object) -> tuple[Member, ...]:
     return members
 
 
-def _reconcile_following(
-    visible: tuple[Member, ...],
-    expected: int,
-    previous: tuple[Member, ...],
-) -> tuple[Member, ...] | None:
-    if expected < 0 or len(visible) > expected:
-        return None
-    if len(visible) == expected:
-        return visible
-    if len(previous) != expected or not previous:
-        return None
-    if any(member.user_id is None for member in previous + visible):
-        return None
-
-    previous_by_id = {member.user_id: member for member in previous}
-    visible_by_id = {member.user_id: member for member in visible}
-    if len(previous_by_id) != expected:
-        return None
-
-    # Only carry hidden entries forward when every currently visible ID already
-    # existed in the last complete local snapshot. If a new visible ID appears,
-    # we cannot know which hidden old ID disappeared, so do not guess.
-    if not set(visible_by_id).issubset(previous_by_id):
-        return None
-
-    merged = dict(previous_by_id)
-    merged.update(visible_by_id)
-    if len(merged) != expected:
-        return None
-    return tuple(merged[key] for key in sorted(merged))
+def _count(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise CheckerError("Collector вернул неверный счётчик пользователей.")
+    return value
 
 
 def _backend_snapshot(
@@ -91,15 +65,18 @@ def _backend_snapshot(
 
     if not isinstance(payload, dict):
         raise CheckerError("Collector вернул данные в неверном формате.")
+    try:
+        returned_account = username(payload.get("account"))
+    except DataError:
+        raise CheckerError("Collector не указал аккаунт снимка.") from None
+    if returned_account != account:
+        raise CheckerError("Collector вернул данные другого аккаунта. Снимок не сохранён.")
 
     followers = _parse_members(payload.get("followers"))
     following_visible = _parse_members(payload.get("following"))
 
-    try:
-        followers_count = int(payload.get("followers_count"))
-        following_count = int(payload.get("following_count"))
-    except (TypeError, ValueError):
-        raise CheckerError("Collector вернул данные в неверном формате.") from None
+    followers_count = _count(payload.get("followers_count"))
+    following_count = _count(payload.get("following_count"))
 
     followers_complete = payload.get("followers_complete")
     if followers_complete is None:
@@ -120,23 +97,15 @@ def _backend_snapshot(
     if following_complete is None:
         following_complete = payload.get("complete") is True
 
-    if following_complete is True:
-        if len(following_visible) != following_count:
-            raise CheckerError(
-                "Количество подписок не совпало со счётчиком. Снимок не сохранён."
-            )
-        samples.append(Sample("following", "", following_visible, "id"))
-    else:
-        reconciled = _reconcile_following(
-            following_visible,
-            following_count,
-            previous_following,
-        )
-        if reconciled is not None:
-            samples.append(Sample("following", "", reconciled, "id"))
-            source += "-local-reconciled"
-        else:
-            source += "-followers-only"
+    # Only currently observed IDs belong in the current following sample.
+    # Equal counters cannot prove that old hidden IDs are still followed.
+    try:
+        samples.append(Sample(
+            "following", "", following_visible, "id",
+            complete=following_complete, expected_count=following_count,
+        ))
+    except DataError as exc:
+        raise CheckerError(str(exc)) from None
 
     return Snapshot(account, captured_at, tuple(samples), source)
 

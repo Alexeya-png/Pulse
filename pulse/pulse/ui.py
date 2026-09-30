@@ -28,6 +28,7 @@ from kivy.utils import platform
 from .model import DataError, Member, Sample, Snapshot, username
 from .store import Store
 from .checker_client import collect_snapshot
+from .presentation import nonreciprocal_empty, nonreciprocal_notice
 
 BG = (0.047, 0.055, 0.078, 1)
 CARD = (0.09, 0.102, 0.137, 1)
@@ -211,7 +212,7 @@ class PulseApp(App):
         root.add_widget(stats)
         self.sync_btn = Pill(text="Собрать данные", fill=LIME, color=BG, bold=True, size_hint_y=None, height=dp(48), on_release=lambda *_: self.collection_action())
         root.add_widget(self.sync_btn)
-        self.status = label("Введите Instagram-ник и нажмите «Собрать данные».", size=12, color=MUTED, height=54)
+        self.status = label("Введите Instagram-ник и нажмите «Собрать данные».", size=12, color=MUTED, height=76)
         root.add_widget(self.status)
         tabs = BoxLayout(size_hint_y=None, height=dp(37), spacing=dp(6))
         self.tabs = []
@@ -339,11 +340,7 @@ class PulseApp(App):
         self.message("Собираем данные автоматически. Вход в Instagram не требуется…")
 
         def work():
-            previous_following = self.store.current_members(account, "following")
-            snapshot = collect_snapshot(
-                account,
-                previous_following=previous_following,
-            )
+            snapshot = collect_snapshot(account)
             changes = self.store.ingest(snapshot)
             return changes, snapshot
 
@@ -354,27 +351,17 @@ class PulseApp(App):
             self.cursor, self.page_stack = None, []
             self.refresh()
             summary = self.store.summary(account)
-            reciprocal_ready = self.store.nonreciprocal(account, limit=1)["ready"]
-            reciprocal_text = (
-                f"Не взаимно: {summary['nonreciprocal'] or 0}."
-                if reciprocal_ready
-                else "Не взаимно: — (Instagram скрыл часть подписок)."
-            )
-            reconciled_note = (
-                " Скрытые подписки восстановлены из предыдущего полного снимка."
-                if "local-reconciled" in snapshot.source
-                else ""
-            )
+            reciprocal_text = nonreciprocal_notice(self.store.nonreciprocal(account, limit=1))
             if changes.baselines and not changes.compared:
                 self.message(
                     f"Первый снимок сохранён. Подписчиков: {summary['followers'] or 0}. "
-                    f"{reciprocal_text}{reconciled_note}"
+                    f"{reciprocal_text} Отписки появятся после следующей проверки."
                 )
             else:
                 self.message(
                     f"Проверено. Отписались: {summary['latest_unfollowers'] or 0}. "
                     f"Новые: {summary['latest_new_followers'] or 0}. "
-                    f"{reciprocal_text}{reconciled_note}"
+                    f"{reciprocal_text}"
                 )
             self._update_collection_button()
 
@@ -393,6 +380,8 @@ class PulseApp(App):
         stats = self.store.summary(account)
         for widget, value in zip(self.stats, (stats["followers"], stats["latest_unfollowers"], stats["nonreciprocal"])):
             widget.text = "—" if value is None else f"{value:,}".replace(",", " ")
+        if stats["nonreciprocal"] is not None and not stats["nonreciprocal_complete"]:
+            self.stats[2].text += "+"
         for widget, filt in self.tabs:
             widget.fill = (0.20, 0.26, 0.15, 1) if self.filter == filt else CARD
             widget.color = LIME if self.filter == filt else MUTED
@@ -403,6 +392,8 @@ class PulseApp(App):
         if reciprocal_view:
             reciprocal = self.store.nonreciprocal(account, after=self.cursor, limit=81)
             rows = reciprocal["users"]
+            if reciprocal["ready"] and not reciprocal["complete"]:
+                self.history_note.text = f"Подтверждено {reciprocal['total']} · скрыто {reciprocal['hidden_count']}"
         else:
             rows = self.store.events(account, *self.filter, before=self.cursor, limit=81, latest=not self.history_all)
         self.visible_rows = rows[:80]
@@ -415,14 +406,17 @@ class PulseApp(App):
         if not self.rv.data:
             title, detail = "Пока нет изменений", "Изменения определяются по двум полным проверкам."
             if reciprocal_view:
-                title = "Невзаимных подписок нет" if reciprocal["ready"] else "Нет полных данных"
-                detail = "По последним сохранённым спискам." if reciprocal["ready"] else "Нужны подписчики и подписки из одной проверки."
+                title, detail = nonreciprocal_empty(reciprocal)
             self.rv.data = [{"title": title, "detail": detail, "badge": "·", "tint": MUTED}]
         self.rv.scroll_y = 1
         self._update_collection_button()
         if not self.busy and not self.prefs.get("export_pending"):
             if stats["last_seen"]:
-                self.message(("Демо · вымышленные данные\n" if self.demo_mode else "") + f"Последние данные: {short_date(stats['last_seen'])}")
+                coverage_note = (
+                    f"\nПодтверждённые невзаимные: {stats['nonreciprocal']}. Скрыто подписок: {stats['following_hidden']}."
+                    if stats["nonreciprocal"] is not None and not stats["nonreciprocal_complete"] else ""
+                )
+                self.message(("Демо · вымышленные данные\n" if self.demo_mode else "") + f"Последние данные: {short_date(stats['last_seen'])}" + coverage_note)
             else:
                 self.message("Первый сбор сохранит точку отсчёта. Следующий покажет изменения.")
 
@@ -496,8 +490,9 @@ class PulseApp(App):
     def help_dialog(self):
         self.dialog(
             "Как работает Pulse",
-            "Введите Instagram-ник и нажмите «Собрать данные». Вход в Instagram не нужен: Pulse сначала пробует получить публичные данные напрямую через сеть телефона, а если Instagram не отдаёт список анонимно — использует наш собственный backend collector. HikerAPI, Apify и сторонние scraper-сервисы не используются. Первый полный сбор сохраняется как точка отсчёта. Следующие сборы сравниваются с предыдущим и показывают отписки, новых подписчиков и невзаимные подписки.\n\n"
-            "Пароль, cookies и Instagram-сессия пользователя не запрашиваются и не сохраняются. Неполный список не сохраняется как корректный снимок."
+            "Введите Instagram-ник и нажмите «Собрать данные». Вход в Instagram не нужен. Первый полный список подписчиков сохраняет точку отсчёта. Следующий сбор покажет, кто исчез из списка и кто появился. Прошлые отписки до первой проверки определить нельзя.\n\n"
+            "«Не взаимно» показывает тех, на кого вы подписаны и кого нет среди всех ваших подписчиков. Если Instagram скрыл часть подписок, доступны только подтверждённые аккаунты: число отмечено знаком +, рядом указано, сколько подписок недоступно. Старые скрытые подписки не подставляются.\n\n"
+            "Неполный список подписчиков не сохраняется и не создаёт ложные отписки."
         )
 
     def on_pause(self):

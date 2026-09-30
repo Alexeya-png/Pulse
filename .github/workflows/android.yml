@@ -64,7 +64,7 @@ jobs:
           apks=(bin/*.apk)
           test "${#apks[@]}" -gt 0
           for apk in "${apks[@]}"; do
-            "$signer" verify --verbose "$apk"
+            "$signer" verify --verbose --print-certs "$apk"
           done
           (cd bin && sha256sum *.apk > SHA256SUMS.txt)
 
