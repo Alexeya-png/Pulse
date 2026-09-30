@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
@@ -7,7 +8,7 @@ from unittest.mock import MagicMock, patch
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from checker_backend import main
+from checker_backend import direct_instagram, main
 
 
 class ApiTests(unittest.TestCase):
@@ -54,6 +55,77 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(response.json()["complete"])
         self.assertEqual(response.json()["source"], "pulse-direct-fallback")
         direct.assert_called_once()
+
+    def test_direct_session_uses_browser_headers_and_csrf(self):
+        with patch.dict(
+            os.environ,
+            {"IG_SESSION_JSON": '{"sessionid":"secret","csrftoken":"csrf-token"}'},
+        ):
+            session = direct_instagram._make_session()
+        try:
+            self.assertTrue(session.headers["User-Agent"].startswith("Mozilla/5.0"))
+            self.assertEqual(session.headers["X-CSRFToken"], "csrf-token")
+            self.assertEqual(session.cookies.get("sessionid"), "secret")
+        finally:
+            session.close()
+
+    def test_direct_transport_switches_after_rate_limit(self):
+        primary = direct_instagram.requests.Session()
+        alternative = direct_instagram.requests.Session()
+        with patch.object(
+            direct_instagram,
+            "_fetch_once",
+            side_effect=[
+                (429, None),
+                (200, {"status": "ok"}),
+            ],
+        ), patch.object(
+            direct_instagram,
+            "_fallback_sessions",
+            return_value=[("minimal-browser", alternative)],
+        ), patch.object(
+            direct_instagram,
+            "IG_429_RETRIES",
+            0,
+        ):
+            status, data = direct_instagram._json_get(
+                primary,
+                "https://www.instagram.com/api/v1/users/web_profile_info/",
+                {"username": "example"},
+                time.monotonic() + 10,
+            )
+        primary.close()
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"status": "ok"})
+
+    def test_direct_transport_returns_forbidden_instead_of_false_rate_limit(self):
+        primary = direct_instagram.requests.Session()
+        alternative = direct_instagram.requests.Session()
+        with patch.object(
+            direct_instagram,
+            "_fetch_once",
+            side_effect=[
+                (429, None),
+                (403, None),
+            ],
+        ), patch.object(
+            direct_instagram,
+            "_fallback_sessions",
+            return_value=[("mobile-auth", alternative)],
+        ), patch.object(
+            direct_instagram,
+            "IG_429_RETRIES",
+            0,
+        ):
+            status, data = direct_instagram._json_get(
+                primary,
+                "https://i.instagram.com/api/v1/friendships/1/following/",
+                {"count": 50},
+                time.monotonic() + 10,
+            )
+        primary.close()
+        self.assertEqual(status, 403)
+        self.assertIsNone(data)
 
     def test_input_validation(self):
         with patch.object(main, "_collect_profile") as collect:
