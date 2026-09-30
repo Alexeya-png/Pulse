@@ -93,13 +93,8 @@ def _custom(data: dict, account: str) -> Snapshot:
     samples = []
     if "followers" in data:
         samples.append(_custom_sample(data["followers"], "followers"))
-    if "media" in data:
-        if not isinstance(data["media"], list):
-            raise DataError("media должен быть списком публикаций.")
-        for media in data["media"]:
-            if not isinstance(media, dict):
-                raise DataError("Некорректная запись публикации.")
-            samples.append(_custom_sample(media, "likes", media.get("post_id")))
+    if "following" in data:
+        samples.append(_custom_sample(data["following"], "following"))
     return Snapshot(account, data.get("captured_at"), tuple(samples))
 
 
