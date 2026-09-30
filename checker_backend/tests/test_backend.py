@@ -2,7 +2,7 @@ import os
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -361,6 +361,10 @@ class ApiTests(unittest.TestCase):
 
         with patch.object(
             main,
+            "_collect_full_followers_actor",
+            return_value=[],
+        ), patch.object(
+            main,
             "_collect_session_actor",
             return_value=[],
         ), patch.object(
@@ -469,7 +473,7 @@ class ApiTests(unittest.TestCase):
                 patch.object(main, "_collect_relation", side_effect=relation):
             payload = main._collect_profile("example")
 
-        self.assertEqual(relation_calls, ["Followings", "Followers"])
+        self.assertCountEqual(relation_calls, ["Followings", "Followers"])
         self.assertTrue(payload["complete"])
 
     def test_counts_are_rechecked_after_lists(self):
@@ -543,6 +547,130 @@ class ApiTests(unittest.TestCase):
                 release.set()
             self.assertEqual(first.result(timeout=10).status_code, 403)
         self.assertFalse(main._collect_lock.locked())
+
+    def test_full_provider_resumes_partial_run(self):
+        runs = [
+            {"id": "r1", "defaultDatasetId": "d1"},
+            {"id": "r2", "defaultDatasetId": "d2"},
+        ]
+        pages = [[{"id": "1", "username": "alice"}, {"id": "2", "username": "bob"}],
+                 [{"id": "3", "username": "carol"}]]
+        with (
+            patch.object(main, "_start_actor", side_effect=runs) as start,
+            patch.object(main, "_wait_run", side_effect=runs),
+            patch.object(main, "_dataset_items", side_effect=pages),
+            patch.object(main, "_run_output", return_value={"resumeCursor": "next-page"}),
+        ):
+            result = main._collect_full_following_actor("example", 3, "Подписки")
+        self.assertEqual({row["id"] for row in result}, {"1", "2", "3"})
+        self.assertEqual(start.call_args_list[1].args[1]["resumeCursor"], "next-page")
+        self.assertEqual(start.call_args_list[1].args[1]["maxItem"], 1)
+
+    def test_full_provider_rejects_repeated_cursor(self):
+        run = {"id": "r1", "defaultDatasetId": "d1"}
+        with (
+            patch.object(main, "_start_actor", return_value=run) as start,
+            patch.object(main, "_wait_run", return_value=run),
+            patch.object(main, "_dataset_items", return_value=[{"id": "1", "username": "alice"}]),
+            patch.object(main, "_run_output", return_value={"resumeCursor": "same-page"}),
+        ):
+            with self.assertRaises(HTTPException) as error:
+                main._collect_full_following_actor("example", 3, "Подписки")
+        self.assertEqual(error.exception.status_code, 502)
+        self.assertEqual(start.call_count, 2)
+
+    def test_followers_use_full_provider_with_correct_direction(self):
+        run = {"id": "r1", "defaultDatasetId": "d1"}
+        rows = [{"id": "1", "username": "alice", "type": "followers"}]
+        with (
+            patch.object(main, "_start_actor", return_value=run) as start,
+            patch.object(main, "_wait_run", return_value=run),
+            patch.object(main, "_dataset_items", return_value=rows),
+            patch.object(main, "_collect_session_actor") as session,
+        ):
+            result = main._collect_relation("example", 1, "Followers", "Подписчики")
+        self.assertEqual(result, [{"id": "1", "username": "alice"}])
+        self.assertEqual(start.call_args.args[1]["type"], "followers")
+        session.assert_not_called()
+
+    def test_dataset_reads_beyond_first_page(self):
+        with patch.object(main, "APIFY_PAGE_SIZE", 2), patch.object(
+            main, "_request_json", side_effect=[[1, 2], [3]],
+        ) as request:
+            self.assertEqual(main._dataset_items("dataset"), [1, 2, 3])
+        self.assertEqual([call.kwargs["params"]["offset"] for call in request.call_args_list], [0, 2])
+
+    def test_expired_collection_stops_before_next_actor_and_releases_lock(self):
+        now = [100.0]
+
+        def primary(*args):
+            now[0] += 200
+            return []
+
+        with (
+            patch.object(main.time, "monotonic", side_effect=lambda: now[0]),
+            patch.object(main, "_collect_profile", side_effect=lambda _: main._collect_relation("example", 110, "Followings", "Подписки")),
+            patch.object(main, "_collect_full_following_actor", side_effect=primary),
+            patch.object(main.requests, "request") as request,
+        ):
+            response = self.client.post("/v1/collect", json={"username": "example"})
+        self.assertEqual(response.status_code, 504)
+        request.assert_not_called()
+        self.assertFalse(main._collect_lock.locked())
+
+    def test_poll_failure_aborts_only_its_unfinished_run(self):
+        with patch.object(main, "_request_json", side_effect=main.CollectionTimeout()), patch.object(main, "_abort_run") as abort:
+            with self.assertRaises(main.CollectionTimeout):
+                main._wait_run("owned-run")
+        abort.assert_called_once_with("owned-run")
+
+    def test_successful_run_is_not_aborted(self):
+        with patch.object(main, "_request_json", return_value={"data": {"status": "SUCCEEDED"}}), patch.object(main, "_abort_run") as abort:
+            self.assertEqual(main._wait_run("owned-run")["status"], "SUCCEEDED")
+        abort.assert_not_called()
+
+    def test_http_timeout_uses_remaining_collection_budget(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"data": {}}
+        with patch.object(main, "_remaining", return_value=4), patch.object(main, "_api_token", return_value="test-token"), patch.object(main.requests, "request", return_value=response) as request:
+            main._request_json("GET", "/actor-runs/test")
+        timeout = request.call_args.kwargs["timeout"]
+        self.assertEqual(timeout.total, 4)
+        self.assertEqual(timeout.connect_timeout, 4)
+
+    def test_lists_run_concurrently_with_shared_deadline(self):
+        profile = {"id": "123", "username": "example", "followers_count": 1, "following_count": 1, "is_private": False}
+        barrier = threading.Barrier(2)
+        deadlines = []
+
+        def relation(*args):
+            deadlines.append(main._collection_state.deadline)
+            barrier.wait(timeout=2)
+            return [{"id": "1", "username": "alice"}]
+
+        with patch.object(main, "_profile", return_value=profile), patch.object(main, "_collect_relation", side_effect=relation):
+            response = self.client.post("/v1/collect", json={"username": "example"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(deadlines), 2)
+        self.assertEqual(deadlines[0], deadlines[1])
+
+    def test_final_snapshot_rejects_mismatched_lengths(self):
+        profile = {"id": "123", "username": "example", "followers_count": 2, "following_count": 1, "is_private": False}
+        with patch.object(main, "_profile", return_value=profile), patch.object(main, "_collect_relation", return_value=[{"id": "1", "username": "alice"}]):
+            response = self.client.post("/v1/collect", json={"username": "example"})
+        self.assertEqual(response.status_code, 409)
+
+    def test_changing_list_does_not_fall_back_to_stale_data(self):
+        with patch.object(main, "_collect_full_following_actor", side_effect=HTTPException(409, "changed")), patch.object(main, "_collect_free_following_actor") as fallback:
+            with self.assertRaises(HTTPException) as error:
+                main._collect_relation("example", 110, "Followings", "Подписки")
+        self.assertEqual(error.exception.status_code, 409)
+        fallback.assert_not_called()
+
+    def test_diagnostic_codes_do_not_log_raw_provider_text(self):
+        self.assertEqual(main._diagnostic_code({"error": {"code": "RATE_LIMITED"}}), "RATE_LIMITED")
+        self.assertEqual(main._diagnostic_code({"error": "Instagram rate limited the bounded authenticated request attempts."}), "RATE_LIMITED")
+        self.assertEqual(main._diagnostic_code({"error": "private-session-cookie"}), "UNKNOWN")
 
 
 if __name__ == "__main__":

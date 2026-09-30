@@ -12,5 +12,7 @@ services:
     healthCheckPath: /health
     autoDeployTrigger: commit
     envVars:
+      - key: APIFY_TOKEN
+        sync: false
       - key: IG_SESSION_JSON
         sync: false

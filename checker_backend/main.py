@@ -6,13 +6,15 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from urllib3.util import Timeout
 
-app = FastAPI(title="Pulse Checker", version="0.5.5")
+app = FastAPI(title="Pulse Checker", version="0.5.6")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -37,6 +39,10 @@ APIFY_FULL_FOLLOWING_ACTOR = os.environ.get(
     "APIFY_FULL_FOLLOWING_ACTOR",
     "thenetaji~instagram-followers-followings-scraper",
 )
+APIFY_FULL_FOLLOWERS_ACTOR = os.environ.get(
+    "APIFY_FULL_FOLLOWERS_ACTOR",
+    "thenetaji~instagram-followers-followings-scraper",
+)
 APIFY_FREE_FOLLOWING_ACTOR = os.environ.get(
     "APIFY_FREE_FOLLOWING_ACTOR",
     "publicsignallabs~instagram-following",
@@ -51,13 +57,66 @@ APIFY_RUN_TIMEOUT = max(30, int(os.environ.get("APIFY_RUN_TIMEOUT", "150")))
 APIFY_RELATION_ATTEMPTS = max(1, min(5, int(os.environ.get("APIFY_RELATION_ATTEMPTS", "1"))))
 APIFY_SESSION_ATTEMPTS = max(1, min(2, int(os.environ.get("APIFY_SESSION_ATTEMPTS", "1"))))
 APIFY_RETRY_DELAY = max(0.0, float(os.environ.get("APIFY_RETRY_DELAY", "2.0")))
+COLLECTION_TIMEOUT = max(30, min(180, int(os.environ.get("COLLECTION_TIMEOUT", "180"))))
 TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"}
 _collect_lock = threading.Lock()
+_collection_state = threading.local()
 logger = logging.getLogger("uvicorn.error")
 
 
 class CollectRequest(BaseModel):
     username: str
+
+
+class CollectionTimeout(HTTPException):
+    def __init__(self):
+        super().__init__(504, "Онлайн-collector не успел получить полный снимок за отведённое время. Снимок не сохранён.")
+
+
+def _remaining() -> float:
+    deadline = getattr(_collection_state, "deadline", None)
+    remaining = COLLECTION_TIMEOUT if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        raise CollectionTimeout()
+    return remaining
+
+
+def _pause(seconds: float) -> None:
+    time.sleep(min(seconds, _remaining()))
+    _remaining()
+
+
+def _diagnostic_code(row: dict) -> str:
+    # Actors may put diagnostics under error.code rather than top-level code.
+    # Only known codes enter logs; never log raw provider messages/cookies.
+    error = row.get("error")
+    values = [row.get("code"), row.get("errorCode")]
+    if isinstance(error, dict):
+        values.extend([error.get("code"), error.get("type")])
+    elif isinstance(error, str):
+        values.append(error)
+    values.extend([row.get("message"), row.get("status")])
+    known = {"BAD_INPUT", "NOT_FOUND", "NO_RESULTS", "PROVIDER_UNSUPPORTED",
+             "PARTIAL", "RATE_LIMITED", "PROVIDER_AUTH", "SESSION_EXHAUSTED",
+             "SERVER_ERROR", "NETWORK"}
+    for value in values:
+        if isinstance(value, str) and value.upper() in known:
+            return value.upper()
+        if isinstance(value, str) and "rate limit" in value.lower():
+            return "RATE_LIMITED"
+    return "UNKNOWN"
+
+
+def _abort_run(run_id: str) -> None:
+    try:
+        response = requests.post(
+            APIFY_BASE_URL + f"/actor-runs/{run_id}/abort",
+            headers={"Authorization": f"Bearer {_api_token()}"},
+            timeout=Timeout(total=5, connect=2, read=3),
+        )
+        logger.info("Stopped unfinished provider run (HTTP %d)", response.status_code)
+    except (requests.RequestException, HTTPException):
+        logger.warning("Could not stop unfinished provider run")
 
 
 def _normal_username(value: str) -> str:
@@ -103,6 +162,7 @@ def _request_json(
     timeout: tuple[int, int] = (10, 120),
     allow_404: bool = False,
 ):
+    remaining = _remaining()
     try:
         response = requests.request(
             method,
@@ -112,9 +172,9 @@ def _request_json(
             headers={
                 "Authorization": f"Bearer {_api_token()}",
                 "Accept": "application/json",
-                "User-Agent": "PulseChecker/0.5.1",
+                "User-Agent": "PulseChecker/0.5.6",
             },
-            timeout=timeout,
+            timeout=Timeout(total=remaining, connect=min(timeout[0], remaining), read=min(timeout[1], remaining)),
         )
     except requests.RequestException:
         raise HTTPException(
@@ -145,23 +205,8 @@ def _request_json(
             "Онлайн-сервис Instagram-данных временно недоступен.",
         )
     if response.status_code >= 400:
-        try:
-            payload = response.json()
-            provider_message = (
-                payload.get("error", {}).get("message")
-                if isinstance(payload, dict) and isinstance(payload.get("error"), dict)
-                else None
-            )
-        except ValueError:
-            provider_message = None
-        if provider_message:
-            logger.warning(
-                "Apify request failed (%s): %s",
-                response.status_code,
-                str(provider_message)[:400],
-            )
-        else:
-            logger.warning("Apify request failed (%s)", response.status_code)
+        # Provider error text may echo submitted input, including session cookies.
+        logger.warning("Apify request failed (%s)", response.status_code)
         raise HTTPException(
             502,
             f"Онлайн-collector вернул ошибку {response.status_code}.",
@@ -195,7 +240,7 @@ def _profile(username: str) -> dict:
             "includeAboutSection": False,
         },
         params={
-            "timeout": 60,
+            "timeout": max(1, min(60, int(_remaining()) - 5)),
             "memory": 256,
             "maxItems": 1,
         },
@@ -239,12 +284,15 @@ def _profile(username: str) -> dict:
 
 
 def _start_actor(actor: str, body: dict) -> dict:
+    remaining = _remaining()
+    if remaining < 25:
+        raise CollectionTimeout()
     payload = _request_json(
         "POST",
         f"/actors/{actor}/runs",
         body=body,
         params={
-            "timeout": APIFY_RUN_TIMEOUT,
+            "timeout": max(1, min(APIFY_RUN_TIMEOUT, int(remaining) - 5)),
         },
         timeout=(10, 45),
     )
@@ -255,42 +303,48 @@ def _start_actor(actor: str, body: dict) -> dict:
 
 
 def _wait_run(run_id: str) -> dict:
-    deadline = time.monotonic() + APIFY_RUN_TIMEOUT + 15
-    while time.monotonic() < deadline:
-        payload = _request_json(
-            "GET",
-            f"/actor-runs/{run_id}",
-            timeout=(10, 30),
-        )
-        run = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(run, dict):
-            raise HTTPException(502, "Онлайн-collector потерял состояние сбора.")
-        status = str(run.get("status") or "").upper()
-        if status in TERMINAL_STATUSES:
-            if status != "SUCCEEDED":
-                raise HTTPException(
-                    502,
-                    f"Онлайн-collector завершил сбор со статусом {status}.",
-                )
-            return run
-        time.sleep(APIFY_POLL_SECONDS)
-    raise HTTPException(504, "Онлайн-collector слишком долго собирает данные.")
+    deadline = time.monotonic() + min(APIFY_RUN_TIMEOUT + 15, _remaining())
+    finished = False
+    try:
+        while time.monotonic() < deadline:
+            payload = _request_json("GET", f"/actor-runs/{run_id}", timeout=(10, 30))
+            run = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(run, dict):
+                raise HTTPException(502, "Онлайн-collector потерял состояние сбора.")
+            status = str(run.get("status") or "").upper()
+            if status in TERMINAL_STATUSES:
+                finished = True
+                if status != "SUCCEEDED":
+                    raise HTTPException(502, f"Онлайн-collector завершил сбор со статусом {status}.")
+                return run
+            _pause(min(APIFY_POLL_SECONDS, max(0, deadline - time.monotonic())))
+        raise CollectionTimeout()
+    finally:
+        if not finished:
+            _abort_run(run_id)
 
 
 def _dataset_items(dataset_id: str) -> list:
-    items = _request_json(
-        "GET",
-        f"/datasets/{dataset_id}/items",
-        params={
-            "clean": "true",
-            "format": "json",
-            "limit": APIFY_PAGE_SIZE,
-        },
-        timeout=(10, 60),
-    )
-    if not isinstance(items, list):
-        raise HTTPException(502, "Онлайн-collector вернул повреждённый список.")
-    return items
+    result = []
+    while True:
+        items = _request_json(
+            "GET",
+            f"/datasets/{dataset_id}/items",
+            params={
+                "clean": "true",
+                "format": "json",
+                "limit": APIFY_PAGE_SIZE,
+                "offset": len(result),
+            },
+            timeout=(10, 60),
+        )
+        if not isinstance(items, list):
+            raise HTTPException(502, "Онлайн-collector вернул повреждённый список.")
+        result.extend(items)
+        if len(result) > MAX_MEMBERS + APIFY_PAGE_SIZE:
+            raise HTTPException(413, "Список провайдера больше лимита сервера.")
+        if len(items) < APIFY_PAGE_SIZE:
+            return result
 
 
 def _run_output(run_id: str) -> dict:
@@ -381,6 +435,7 @@ def _collect_session_actor(
             "maxRunSeconds": 90,
             "maxAttempts": 4,
         })
+    body["maxRunSeconds"] = max(20, min(body["maxRunSeconds"], int(_remaining()) - 5))
     sessionid = _checker_sessionid()
     if list_type == "following":
         if not sessionid:
@@ -418,13 +473,7 @@ def _collect_session_actor(
             found[member["id"]] = member
             continue
         if row.get("ok") is False:
-            code = str(
-                row.get("code")
-                or row.get("error")
-                or row.get("message")
-                or row.get("status")
-                or "UNKNOWN"
-            )[:96]
+            code = _diagnostic_code(row)
             diagnostic_codes.append(code)
 
     if diagnostic_codes:
@@ -442,51 +491,78 @@ def _collect_session_actor(
     return list(found.values())
 
 
-def _collect_full_following_actor(
+def _collect_full_relation_actor(
+    actor: str,
     username: str,
     expected: int,
+    data_type: str,
     label: str,
 ) -> list[dict]:
-    run = _start_actor(
-        APIFY_FULL_FOLLOWING_ACTOR,
-        {
+    found: dict[str, dict] = {}
+    cursor = None
+    seen_cursors: set[str] = set()
+    for _ in range((expected // APIFY_PAGE_SIZE) + 3):
+        body = {
             "username": [username],
-            "type": "followings",
-            "maxItem": expected,
+            "type": "followers" if data_type == "Followers" else "followings",
+            "maxItem": expected - len(found),
             "enrichProfile": False,
             "fullProfileDetails": False,
-        },
-    )
-    run = _wait_run(str(run["id"]))
-    dataset_id = run.get("defaultDatasetId")
-    if not dataset_id:
-        raise HTTPException(
-            502,
-            f"{label}: full-provider не создал результат.",
-        )
-
-    rows = _dataset_items(str(dataset_id))
-    found: dict[str, dict] = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        if row.get("cursor") is not None and not row.get("username"):
-            continue
-        member = _member(row, username, "Followings")
-        found[member["id"]] = member
-        if len(found) > expected:
+        }
+        if cursor:
+            body["resumeCursor"] = cursor
+        run = _start_actor(actor, body)
+        run = _wait_run(str(run["id"]))
+        dataset_id = run.get("defaultDatasetId")
+        if not dataset_id:
             raise HTTPException(
-                409,
-                f"{label}: список изменился во время проверки. Снимок не сохранён.",
+                502,
+                f"{label}: full-provider не создал результат.",
             )
 
+        rows = _dataset_items(str(dataset_id))
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("cursor") is not None and not row.get("username"):
+                continue
+            member = _member(row, username, data_type)
+            found[member["id"]] = member
+            if len(found) > expected:
+                raise HTTPException(
+                    409,
+                    f"{label}: список изменился во время проверки. Снимок не сохранён.",
+                )
+
+        if len(found) == expected:
+            break
+        output = _run_output(str(run["id"]))
+        cursor = output.get("resumeCursor")
+        if not cursor:
+            break
+        if not isinstance(cursor, str) or cursor in seen_cursors:
+            raise HTTPException(502, f"{label}: full-provider повторил страницу.")
+        seen_cursors.add(cursor)
+
     logger.info(
-        "Apify full following actor returned %d/%d for %s",
+        "Apify full relation actor returned %d/%d for %s",
         len(found),
         expected,
         label,
     )
     return list(found.values())
+
+
+def _collect_full_following_actor(username: str, expected: int, label: str) -> list[dict]:
+    return _collect_full_relation_actor(
+        APIFY_FULL_FOLLOWING_ACTOR, username, expected, "Followings", label,
+    )
+
+
+def _collect_full_followers_actor(username: str, expected: int, label: str) -> list[dict]:
+    return _collect_full_relation_actor(
+        APIFY_FULL_FOLLOWERS_ACTOR, username, expected, "Followers", label,
+    )
 
 
 def _collect_free_following_actor(
@@ -577,7 +653,7 @@ def _collect_official_actor(
         if not isinstance(row, dict):
             continue
         if row.get("error"):
-            errors.append(str(row.get("error"))[:96])
+            errors.append(_diagnostic_code(row))
             continue
         member = _member(row, username, data_type)
         found[member["id"]] = member
@@ -698,18 +774,19 @@ def _collect_relation(
     normalized_type = data_type.strip().lower()
     is_following = normalized_type in {"following", "followings"}
 
-    if is_following and APIFY_FULL_FOLLOWING_ACTOR:
+    if (APIFY_FULL_FOLLOWING_ACTOR if is_following else APIFY_FULL_FOLLOWERS_ACTOR):
         try:
-            result = _collect_full_following_actor(
+            primary = _collect_full_following_actor if is_following else _collect_full_followers_actor
+            result = primary(
                 username,
                 expected,
                 label,
             )
         except HTTPException as exc:
-            if exc.status_code in (401, 403, 429):
+            if isinstance(exc, CollectionTimeout) or exc.status_code in (401, 403, 409, 429):
                 raise
             logger.warning(
-                "Apify full following actor failed for %s (%d)",
+                "Apify full relation actor failed for %s (%d)",
                 label,
                 exc.status_code,
             )
@@ -733,7 +810,7 @@ def _collect_relation(
                 label,
             )
         except HTTPException as exc:
-            if exc.status_code in (401, 403, 429):
+            if isinstance(exc, CollectionTimeout) or exc.status_code in (401, 403, 409, 429):
                 raise
             logger.warning(
                 "Apify free following actor failed for %s (%d)",
@@ -761,7 +838,7 @@ def _collect_relation(
                 label,
             )
         except HTTPException as exc:
-            if exc.status_code in (401, 403, 429):
+            if isinstance(exc, CollectionTimeout) or exc.status_code in (401, 403, 409, 429):
                 raise
             logger.warning(
                 "Apify public actor failed for %s (%d)",
@@ -790,7 +867,7 @@ def _collect_relation(
                     label,
                 )
             except HTTPException as exc:
-                if exc.status_code in (401, 403, 429):
+                if isinstance(exc, CollectionTimeout) or exc.status_code in (401, 403, 409, 429):
                     raise
                 logger.warning(
                     "Apify session actor attempt %d failed (%d)",
@@ -817,7 +894,7 @@ def _collect_relation(
                 expected,
             )
             if attempt + 1 < APIFY_SESSION_ATTEMPTS and APIFY_RETRY_DELAY:
-                time.sleep(APIFY_RETRY_DELAY)
+                _pause(APIFY_RETRY_DELAY)
 
     if is_following:
         raise HTTPException(
@@ -856,7 +933,7 @@ def _collect_relation(
                     label,
                 )
             except HTTPException as exc:
-                if exc.status_code in (401, 403, 429):
+                if isinstance(exc, CollectionTimeout) or exc.status_code in (401, 403, 409, 429):
                     raise
                 logger.warning(
                     "Apify relation actor %s attempt %d failed (%d)",
@@ -885,12 +962,22 @@ def _collect_relation(
                 expected,
             )
             if attempt + 1 < APIFY_RELATION_ATTEMPTS and APIFY_RETRY_DELAY:
-                time.sleep(APIFY_RETRY_DELAY)
+                _pause(APIFY_RETRY_DELAY)
 
     raise HTTPException(
         409,
         f"{label}: получено {len(combined)} из {expected}. Снимок не сохранён.",
     )
+
+
+def _relation_with_deadline(deadline: float, *args) -> list[dict]:
+    # Thread-local deadlines must be copied explicitly to the two list workers.
+    _collection_state.deadline = deadline
+    try:
+        _remaining()
+        return _collect_relation(*args)
+    finally:
+        _collection_state.deadline = None
 
 
 def _collect_profile(target: str) -> dict:
@@ -910,18 +997,16 @@ def _collect_profile(target: str) -> dict:
         following_count,
     )
 
-    following = _collect_relation(
-        target,
-        following_count,
-        "Followings",
-        "Подписки",
-    )
-    followers = _collect_relation(
-        target,
-        followers_count,
-        "Followers",
-        "Подписчики",
-    )
+    deadline = time.monotonic() + _remaining()
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        following_job = workers.submit(
+            _relation_with_deadline, deadline, target, following_count, "Followings", "Подписки",
+        )
+        followers_job = workers.submit(
+            _relation_with_deadline, deadline, target, followers_count, "Followers", "Подписчики",
+        )
+        following = following_job.result()
+        followers = followers_job.result()
 
     after = _profile(target)
     if after["id"] != user_id:
@@ -937,8 +1022,11 @@ def _collect_profile(target: str) -> dict:
             409,
             "Списки изменились прямо во время проверки. Запустите сбор ещё раз.",
         )
+    if len(followers) != followers_count or len(following) != following_count:
+        raise HTTPException(409, "Получены неполные списки. Снимок не сохранён.")
+    _remaining()
     logger.info(
-        "Online complete accessible snapshot collected (%d/%d followers, %d/%d following)",
+        "Online complete snapshot collected (%d/%d followers, %d/%d following)",
         len(followers),
         after["followers_count"],
         len(following),
@@ -975,6 +1063,7 @@ def collect(request: CollectRequest):
             "Сейчас уже выполняется другая проверка. Попробуйте позже.",
         )
     try:
+        _collection_state.deadline = time.monotonic() + COLLECTION_TIMEOUT
         try:
             return _collect_profile(target)
         except HTTPException:
@@ -986,4 +1075,5 @@ def collect(request: CollectRequest):
                 f"Не удалось выполнить онлайн-сбор: {exc.__class__.__name__}.",
             ) from exc
     finally:
+        _collection_state.deadline = None
         _collect_lock.release()
