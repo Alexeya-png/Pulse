@@ -1,25 +1,52 @@
 # Pulse checker backend
 
-The backend uses one dedicated Instagram account to read the followers and
-following lists that account is allowed to see. Pulse keeps snapshots locally
-on the Android device and compares only complete snapshots.
+The backend uses one dedicated Instagram checker account to read followers and
+following lists that account is allowed to see. Pulse stores snapshots locally
+on Android and compares only complete snapshots.
 
 ## Environment
 
 Required:
 
-- IG_SESSION_JSON: a JSON object containing the checker account's sessionid
-  and any other session cookies. Password login is not implemented.
+- IG_SESSION_JSON: JSON containing the checker account sessionid and any other
+  Instagram cookies.
 
 Optional:
 
 - MAX_MEMBERS (default: 500000)
 
-Do not commit session cookies to GitHub. Put them directly into Render environment
-variables. This service has no HikerAPI calls, keys, or fallback. Playwright opens
-an authenticated Instagram session, but follower/following members are read from
-Instagram's own web data requests with pagination instead of scraping the visible
-list dialog from the DOM.
+Never commit the session to GitHub. Keep IG_SESSION_JSON only in Render.
+
+## Collector
+
+The collector is self-hosted and has no HikerAPI dependency or fallback.
+
+It uses direct authenticated HTTP requests to Instagram with the checker session.
+It does not use Chromium, Playwright, Firefox, WebKit, DOM scraping, or browser
+downloads.
+
+Profile resolution tries Instagram web_profile_info on the web and i.instagram
+hosts. If that identifies the account but exact counts are missing, the collector
+uses the Instagram user info endpoint. Search is only a last-resort way to resolve
+the numeric user ID; exact follower/following counts are still required before a
+snapshot starts.
+
+Followers and following are fetched from Instagram friendship endpoints with
+next_max_id pagination. Members are keyed by stable Instagram numeric IDs, not
+usernames.
+
+The completeness rules match the previously working collector:
+
+1. Read exact follower and following counts before collection.
+2. Fetch every page until Instagram returns no next_max_id.
+3. Reject repeated cursors, malformed pages, rate limits, and partial lists.
+4. Read the exact profile counts again after collection.
+5. Reject the snapshot if the account ID or either count changed during collection.
+6. Return success only when both collected list sizes equal the exact counts.
+
+Private targets are not rejected in advance. If the checker account is allowed to
+read their lists, collection can proceed; otherwise Instagram's access response is
+returned as an error.
 
 ## Run
 
@@ -28,64 +55,41 @@ python -m checker_backend.build
 uvicorn checker_backend.main:app --host 0.0.0.0 --port 10000 --workers 1
 ~~~
 
-The build installs pinned Python dependencies and runs
-python -m playwright install --only-shell chromium. Only Chromium headless
-shell and Playwright's small required helpers are installed, not full Chromium,
-Firefox, or WebKit. Linux machines missing OS libraries can use
-python -m checker_backend.build --with-deps (requires root/sudo).
-
-Browser files live in checker_backend/.browsers, included in the deployed build
-but ignored by Git. Both build and runtime select this directory explicitly;
-an old PLAYWRIGHT_BROWSERS_PATH=/tmp/... environment value is ignored.
-No browser downloads happen during startup or collection.
-
-The build and application startup both launch the shell and render a local test
-page. A missing executable or system library prevents deployment readiness instead
-of failing the first user request. Each collection owns and closes its browser,
-including on errors; sync Playwright objects are never shared between request
-threads. One collection runs at a time (concurrent requests still receive 429).
-Keep Uvicorn at one worker to preserve this limit. Browser memory is released
-between collections; this does not guarantee lower peak memory during collection.
-
-The collector no longer requires Instagram to render clickable followers/following
-links or the list modal. It resolves the target inside the authenticated Instagram
-session and reads the paginated friendship data that the website itself uses.
-If one profile-info route is unavailable for a specific account, target resolution
-falls back to Instagram web search. A partial list is never accepted as complete.
+The build installs only Python dependencies. There is no browser installation.
 
 ## Render
 
-render.yaml records the configuration for the existing pulse-checker service:
+Keep the existing pulse-checker service and URL.
 
 - Build command: python -m checker_backend.build
 - Start command: uvicorn checker_backend.main:app --host 0.0.0.0 --port $PORT --workers 1
-- Health check: /health
-- Branch: main; Python runtime; Frankfurt; existing Free plan.
+- Branch: main
+- Region: Frankfurt
+- IG_SESSION_JSON remains configured only as a Render secret
 
-For a manually created service, apply these settings in Render once; adding a
-Blueprint file alone does not update that service. Keep the existing service/URL
-and its IG_SESSION_JSON. Do not create a replacement service or use the Hiker
-backup branch. A successful build logs the installed components and size;
-startup logs Chromium headless shell smoke check passed before readiness.
+Do not create a replacement service and do not use the Hiker backup branch.
 
-## Compatibility and tests
+## Compatibility
 
-GET /health and POST /v1/collect with {"username":"example"} keep their
-existing contract, including snapshot fields, member IDs/usernames, completeness
-checks, and HTTP errors with a detail field. APK code and its backend URL are
-unchanged. Backend-only commits do not trigger an APK rebuild.
+GET /health remains:
 
-~~~bash
-python -m pip install httpx==0.28.1
-python -m unittest discover -s checker_backend/tests -v
-~~~
+- ok
+- engine = pulse-web-collector
+- session_configured
+- hiker_dependency = false
 
-Tests cover HTTP compatibility, missing visible-list links, profile-resolution
-fallback, friendship pagination/deduplication, partial-snapshot rejection,
-concurrent requests, cleanup, startup failure, real headless rendering and browser
-use across distinct request threads. They never connect to Instagram.
+POST /v1/collect keeps the Android response shape:
 
-For private target accounts, the checker account must already follow the
-target. The service never treats a partial fetch as an unfollow event: if the
-returned list length does not match Instagram's count, the request fails and
-Pulse keeps the previous snapshot.
+- account
+- captured_at
+- followers_count
+- following_count
+- followers
+- following
+- complete
+- source
+
+Member objects remain id + username. IDs now use Instagram's stable numeric user ID,
+matching the behavior of the previously working data collector more closely.
+
+Backend-only commits do not rebuild the APK.
