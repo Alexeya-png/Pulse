@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from checker_backend.direct_instagram import collect_direct_snapshot
 
-app = FastAPI(title="Pulse Checker", version="0.7.0")
+app = FastAPI(title="Pulse Checker", version="0.7.1")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 COLLECTION_TIMEOUT = max(30, min(210, int(os.environ.get("COLLECTION_TIMEOUT", "180"))))
