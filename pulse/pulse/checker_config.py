@@ -1,3 +1,3 @@
 """Public checker backend configuration."""
 
-BACKEND_BASE_URL = "https://YOUR-PULSE-CHECKER.onrender.com"
+BACKEND_BASE_URL = "https://pulse-checker-702b.onrender.com"
