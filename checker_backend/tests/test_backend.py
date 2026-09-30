@@ -137,6 +137,61 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data, {"status": "ok"})
 
+    def test_direct_transport_returns_429_so_other_endpoints_can_run(self):
+        primary = direct_instagram.requests.Session()
+        alternatives = [
+            ("minimal-browser", direct_instagram.requests.Session()),
+            ("mobile-auth", direct_instagram.requests.Session()),
+            ("anonymous-browser", direct_instagram.requests.Session()),
+        ]
+        with patch.object(
+            direct_instagram,
+            "_fetch_once",
+            side_effect=[(429, None), (429, None), (429, None), (429, None)],
+        ), patch.object(
+            direct_instagram,
+            "_fallback_sessions",
+            return_value=alternatives,
+        ), patch.object(
+            direct_instagram,
+            "IG_429_RETRIES",
+            0,
+        ):
+            status, data = direct_instagram._json_get(
+                primary,
+                "https://www.instagram.com/api/v1/users/web_profile_info/",
+                {"username": "example"},
+                time.monotonic() + 10,
+            )
+        primary.close()
+        self.assertEqual(status, 429)
+        self.assertIsNone(data)
+
+    def test_profile_page_counts_parse_exact_metadata(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.text = '<meta content="142 Followers, 110 Following, 4 Posts">'
+        session = direct_instagram.requests.Session()
+        with patch.object(
+            session,
+            "get",
+            return_value=response,
+        ), patch.object(
+            direct_instagram,
+            "_fallback_sessions",
+            return_value=[],
+        ), patch.object(
+            direct_instagram,
+            "_pace",
+        ):
+            followers, following = direct_instagram._profile_page_counts(
+                session,
+                "example",
+                time.monotonic() + 10,
+            )
+        session.close()
+        self.assertEqual((followers, following), (142, 110))
+
     def test_direct_transport_returns_forbidden_instead_of_false_rate_limit(self):
         primary = direct_instagram.requests.Session()
         alternative = direct_instagram.requests.Session()
