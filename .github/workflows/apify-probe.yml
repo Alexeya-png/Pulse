@@ -1,4 +1,4 @@
-name: Temporary Apify fallback schema probe
+name: Temporary scraping-solutions schema probe
 
 on:
   push:
@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
-      - name: Inspect selected fallback schemas
+      - name: Inspect scraping-solutions contracts
         run: |
           python - <<'PY'
           import json
@@ -24,20 +24,13 @@ jobs:
                   return json.load(r)
 
           for actor in [
-              "scrapesmith~instagram-followers-following-scraper",
-              "danek~instagram-followers-following-scraper",
+              "scraping_solutions~instagram-scraper-followers-following",
+              "scraping_solutions~instagram-scraper-followers-following-no-cookies",
           ]:
               print("\n=== ACTOR", actor, "===")
               meta = get(f"https://api.apify.com/v2/acts/{actor}")["data"]
               latest = meta.get("taggedBuilds", {}).get("latest", {})
-              print("META", json.dumps({
-                  "id": meta.get("id"),
-                  "stats": meta.get("stats"),
-                  "pricingInfos": meta.get("pricingInfos"),
-                  "latest": latest,
-              }, ensure_ascii=False))
-              build_id = latest.get("buildId")
-              build = get(f"https://api.apify.com/v2/actor-builds/{build_id}")["data"]
+              build = get(f"https://api.apify.com/v2/actor-builds/{latest['buildId']}")["data"]
               print("INPUT_SCHEMA", build.get("inputSchema"))
-              print("README", (build.get("readme") or "")[:20000])
+              print("README", (build.get("readme") or "")[:12000])
           PY
