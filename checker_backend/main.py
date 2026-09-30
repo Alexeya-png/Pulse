@@ -109,30 +109,30 @@ def _member(row: dict) -> dict:
     return {"id": str(user_id), "username": str(value).lower()}
 
 
-def _collect_pages(path: str, user_id: str, expected: int, label: str) -> list[dict]:
-    if expected > MAX_MEMBERS:
-        raise HTTPException(413, f"{label}: список больше лимита сервера.")
-
+def _collect_pages(
+    path: str,
+    user_id: str,
+    label: str,
+    cursor_param: str,
+    cursor_field: str,
+) -> list[dict]:
     result: dict[str, dict] = {}
-    max_id = None
+    cursor = None
     seen_cursors = set()
 
     while True:
         params = {"user_id": user_id}
-        if max_id:
-            params["max_id"] = max_id
+        if cursor:
+            params[cursor_param] = cursor
 
         page = _get(path, params)
 
-        # HikerAPI v1 chunk endpoints currently return either:
-        #   [users, next_max_id]
-        # or, on some deployments, {"users": [...], "next_max_id": "..."}.
         if isinstance(page, list) and len(page) >= 1:
             users = page[0]
-            next_max_id = page[1] if len(page) > 1 else None
+            next_cursor = page[1] if len(page) > 1 else None
         elif isinstance(page, dict):
             users = page.get("users")
-            next_max_id = page.get("next_max_id")
+            next_cursor = page.get(cursor_field)
         else:
             raise HTTPException(502, f"{label}: HikerAPI вернул неожиданный формат страницы.")
 
@@ -145,24 +145,44 @@ def _collect_pages(path: str, user_id: str, expected: int, label: str) -> list[d
             if len(result) > MAX_MEMBERS:
                 raise HTTPException(413, f"{label}: список больше лимита сервера.")
 
-        if not next_max_id:
+        if not next_cursor:
             break
 
-        next_max_id = str(next_max_id)
-        if next_max_id in seen_cursors:
+        next_cursor = str(next_cursor)
+        if next_cursor in seen_cursors:
             raise HTTPException(502, f"{label}: зациклилась пагинация. Снимок не сохранён.")
-        seen_cursors.add(next_max_id)
-        max_id = next_max_id
-
-        # Keep pressure low on the upstream API for large accounts.
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
         time.sleep(0.03)
 
-    if len(result) != expected:
-        raise HTTPException(
-            409,
-            f"{label}: получен неполный список ({len(result)} из {expected}). Снимок не сохранён.",
-        )
     return list(result.values())
+
+
+def _collect_with_fallback(kind: str, user_id: str, expected: int, label: str) -> list[dict]:
+    if expected > MAX_MEMBERS:
+        raise HTTPException(413, f"{label}: список больше лимита сервера.")
+
+    v1 = _collect_pages(
+        f"/v1/user/{kind}/chunk",
+        user_id,
+        label,
+        "max_id",
+        "next_max_id",
+    )
+    if len(v1) == expected:
+        return v1
+
+    gql = _collect_pages(
+        f"/gql/user/{kind}/chunk",
+        user_id,
+        label,
+        "end_cursor",
+        "end_cursor",
+    )
+    if len(gql) == expected:
+        return gql
+
+    return gql if len(gql) >= len(v1) else v1
 
 
 @app.get("/health")
@@ -194,14 +214,14 @@ def collect(request: CollectRequest):
         before_followers = int(before.get("follower_count") or 0)
         before_following = int(before.get("following_count") or 0)
 
-        followers = _collect_pages(
-            "/v1/user/followers/chunk",
+        followers = _collect_with_fallback(
+            "followers",
             user_id,
             before_followers,
             "Подписчики",
         )
-        following = _collect_pages(
-            "/v1/user/following/chunk",
+        following = _collect_with_fallback(
+            "following",
             user_id,
             before_following,
             "Подписки",
@@ -216,18 +236,24 @@ def collect(request: CollectRequest):
 
         after_followers = int(after.get("follower_count") or 0)
         after_following = int(after.get("following_count") or 0)
-        if after_followers != before_followers or after_following != before_following:
+
+        if len(followers) != after_followers:
             raise HTTPException(
                 409,
-                "Списки изменились прямо во время проверки. Запустите сбор ещё раз.",
+                f"Подписчики: получено {len(followers)} из {after_followers}. Снимок не сохранён.",
+            )
+        if len(following) != after_following:
+            raise HTTPException(
+                409,
+                f"Подписки: получено {len(following)} из {after_following}. Снимок не сохранён.",
             )
 
         return {
             "account": target,
             "account_id": user_id,
             "captured_at": datetime.now(timezone.utc).isoformat(),
-            "followers_count": before_followers,
-            "following_count": before_following,
+            "followers_count": after_followers,
+            "following_count": after_following,
             "followers": followers,
             "following": following,
             "complete": True,
