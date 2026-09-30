@@ -10,13 +10,13 @@ from .model import Member, Sample, Snapshot, username
 
 IG_WEB_APP_ID = "936619743392459"
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
+PROFILE_URLS = (
+    "https://www.instagram.com/api/v1/users/web_profile_info/",
+    "https://i.instagram.com/api/v1/users/web_profile_info/",
+)
 RELATION_BASES = (
     "https://i.instagram.com/api/v1/friendships",
     "https://www.instagram.com/api/v1/friendships",
-)
-PROFILE_URLS = (
-    "https://i.instagram.com/api/v1/users/{user_id}/info/",
-    "https://www.instagram.com/api/v1/users/{user_id}/info/",
 )
 DEFAULT_UA = (
     "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
@@ -38,43 +38,17 @@ def _deadline_left(deadline: float) -> float:
     return left
 
 
-def _normalize_session_data(session_data: object) -> tuple[dict[str, str], str]:
-    if not isinstance(session_data, dict):
-        raise InstagramDirectError("Нужно один раз войти в Instagram в настройках Pulse.")
-    raw_cookies = session_data.get("cookies")
-    cookies: dict[str, str] = {}
-    if isinstance(raw_cookies, dict):
-        for key, value in raw_cookies.items():
-            if value is not None:
-                cookies[str(key)] = str(value)
-    else:
-        for key in ("sessionid", "csrftoken", "ds_user_id", "mid", "ig_did", "rur"):
-            value = session_data.get(key)
-            if value is not None:
-                cookies[key] = str(value)
-    if not cookies.get("sessionid"):
-        raise InstagramDirectError("Вход в Instagram не завершён. Откройте настройки и войдите ещё раз.")
-    user_agent = str(session_data.get("user_agent") or DEFAULT_UA).strip() or DEFAULT_UA
-    return cookies, user_agent
-
-
-def _make_session(session_data: object) -> tuple[requests.Session, dict[str, str]]:
-    cookies, user_agent = _normalize_session_data(session_data)
+def _make_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.instagram.com/",
-        "User-Agent": user_agent,
+        "User-Agent": DEFAULT_UA,
         "X-IG-App-ID": IG_WEB_APP_ID,
         "X-Requested-With": "XMLHttpRequest",
     })
-    csrf = cookies.get("csrftoken")
-    if csrf:
-        session.headers["X-CSRFToken"] = csrf
-    for name, value in cookies.items():
-        session.cookies.set(name, value, domain=".instagram.com", path="/")
-    return session, cookies
+    return session
 
 
 def _json_get(
@@ -96,10 +70,7 @@ def _json_get(
         except requests.RequestException:
             raise InstagramDirectError("Не удалось связаться с Instagram. Проверьте интернет.") from None
 
-        final_url = response.url.lower()
-        if "/challenge/" in final_url or "/checkpoint/" in final_url:
-            raise InstagramDirectError("Instagram просит подтвердить вход. Откройте настройки и войдите ещё раз.")
-        if "/accounts/login" in final_url:
+        if "/accounts/login" in response.url.lower():
             return 401, None
 
         last_status = response.status_code
@@ -122,10 +93,10 @@ def _json_get(
 
 def _as_int(value) -> int | None:
     try:
-        result = int(value)
+        value = int(value)
     except (TypeError, ValueError):
         return None
-    return result if result >= 0 else None
+    return value if value >= 0 else None
 
 
 def _count(user: dict, direct: str, edge: str) -> int | None:
@@ -136,87 +107,73 @@ def _count(user: dict, direct: str, edge: str) -> int | None:
     return _as_int(nested.get("count")) if isinstance(nested, dict) else None
 
 
-def _extract_user(data: dict | None) -> dict | None:
+def _extract_profile(data: dict | None, target: str) -> dict | None:
     if not isinstance(data, dict):
         return None
-    user = data.get("user")
-    if isinstance(user, dict):
-        return user
+    candidates: list[dict] = []
     nested = data.get("data")
     if isinstance(nested, dict):
         user = nested.get("user")
         if isinstance(user, dict):
-            return user
-    return data if data.get("username") else None
+            candidates.append(user)
+    user = data.get("user")
+    if isinstance(user, dict):
+        candidates.append(user)
+    candidates.append(data)
 
-
-def _session_user_id(cookies: dict[str, str]) -> str | None:
-    value = str(cookies.get("ds_user_id") or "").strip()
-    if value.isdigit():
-        return value
-    sessionid = str(cookies.get("sessionid") or "")
-    prefix = sessionid.split("%3A", 1)[0].split(":", 1)[0].strip()
-    return prefix if prefix.isdigit() else None
-
-
-def _current_profile(
-    session: requests.Session,
-    cookies: dict[str, str],
-    target: str,
-    deadline: float,
-) -> dict:
-    target = username(target)
-    user_id = _session_user_id(cookies)
-    candidates: list[tuple[str, dict | None]] = []
-    if user_id:
-        candidates.extend((url.format(user_id=user_id), None) for url in PROFILE_URLS)
-    candidates.extend([
-        ("https://i.instagram.com/api/v1/accounts/current_user/", {"edit": "true"}),
-        ("https://www.instagram.com/api/v1/accounts/current_user/", {"edit": "true"}),
-        ("https://www.instagram.com/api/v1/users/web_profile_info/", {"username": target}),
-        ("https://i.instagram.com/api/v1/users/web_profile_info/", {"username": target}),
-    ])
-
-    saw_auth_error = False
-    for url, params in candidates:
-        status, data = _json_get(session, url, params, deadline)
-        if status in (401, 403):
-            saw_auth_error = True
+    for candidate in candidates:
+        returned_username = str(candidate.get("username") or "").strip().lower()
+        user_id = candidate.get("pk") or candidate.get("id") or candidate.get("pk_id")
+        if returned_username != target or user_id is None:
             continue
-        if status == 429:
-            continue
-        if status != 200:
-            continue
-        user = _extract_user(data)
-        if not user:
-            continue
-        returned_username = str(user.get("username") or "").strip().lower()
-        returned_id = user.get("pk") or user.get("id") or user.get("pk_id") or user_id
-        if not returned_username or returned_id is None:
-            continue
-        if returned_username != target:
-            raise InstagramDirectError(
-                f"В Pulse выполнен вход как @{returned_username}. Для точного списка войдите как @{target}."
-            )
-        if user_id and str(returned_id) != user_id:
-            raise InstagramDirectError(
-                f"Сессия Instagram принадлежит другому аккаунту. Войдите в Pulse как @{target}."
-            )
-        followers_count = _count(user, "follower_count", "edge_followed_by")
-        following_count = _count(user, "following_count", "edge_follow")
+        followers_count = _count(candidate, "follower_count", "edge_followed_by")
+        following_count = _count(candidate, "following_count", "edge_follow")
         if followers_count is None or following_count is None:
             continue
         return {
-            "id": str(returned_id),
+            "id": str(user_id),
             "username": returned_username,
             "followers_count": followers_count,
             "following_count": following_count,
-            "is_private": bool(user.get("is_private")),
+            "is_private": bool(candidate.get("is_private")),
         }
+    return None
 
-    if saw_auth_error:
-        raise InstagramDirectError("Сессия Instagram истекла. Откройте настройки Pulse и войдите ещё раз.")
-    raise InstagramDirectError("Instagram не вернул данные вашего профиля. Попробуйте войти ещё раз.")
+
+def _search_profile(session: requests.Session, target: str, deadline: float) -> dict | None:
+    status, data = _json_get(
+        session,
+        "https://www.instagram.com/api/v1/web/search/topsearch/",
+        {"context": "blended", "query": target, "include_reel": "false"},
+        deadline,
+    )
+    if status != 200 or not isinstance(data, dict):
+        return None
+    for item in data.get("users") or []:
+        if not isinstance(item, dict):
+            continue
+        user = item.get("user") if isinstance(item.get("user"), dict) else item
+        profile = _extract_profile({"user": user}, target)
+        if profile:
+            return profile
+    return None
+
+
+def _profile(session: requests.Session, target: str, deadline: float) -> dict:
+    for url in PROFILE_URLS:
+        status, data = _json_get(session, url, {"username": target}, deadline)
+        if status == 200:
+            profile = _extract_profile(data, target)
+            if profile:
+                return profile
+
+    profile = _search_profile(session, target, deadline)
+    if profile:
+        return profile
+
+    raise InstagramDirectError(
+        "Instagram не отдал публичные данные профиля без авторизации."
+    )
 
 
 def _member(row: dict) -> Member:
@@ -239,9 +196,10 @@ def _relation_page(
     if cursor:
         params["max_id"] = cursor
     status, data = _json_get(session, f"{base}/{user_id}/{kind}/", params, deadline)
-    if status in (401, 403):
-        raise InstagramDirectError("Сессия Instagram истекла. Откройте настройки Pulse и войдите ещё раз.")
-    if status in (404, 429):
+
+    # No login is performed. Auth-gated relationship endpoints simply mean that
+    # this anonymous transport is unavailable and the caller can use our backend.
+    if status in (401, 403, 404, 429):
         return None
     if status != 200 or not isinstance(data, dict) or data.get("status") == "fail":
         return None
@@ -279,12 +237,10 @@ def _collect_relation(
                 member = _member(row)
                 found[member.user_id or member.username] = member
             if len(found) > expected:
-                raise InstagramDirectError("Список изменился прямо во время проверки. Запустите сбор ещё раз.")
+                raise InstagramDirectError("Список изменился прямо во время проверки.")
             if len(found) == expected:
                 return tuple(found.values())
-            if not next_cursor:
-                break
-            if next_cursor in seen_cursors:
+            if not next_cursor or next_cursor in seen_cursors:
                 break
             seen_cursors.add(next_cursor)
             cursor = next_cursor
@@ -292,45 +248,41 @@ def _collect_relation(
 
     label = "подписок" if kind == "following" else "подписчиков"
     raise InstagramDirectError(
-        f"Instagram вернул неполный список {label}: {len(found)} из {expected}. Снимок не сохранён."
+        f"Instagram без входа отдал неполный список {label}: {len(found)} из {expected}."
     )
 
 
 def collect_snapshot_direct(
     account: str,
-    session_data: object,
-    timeout_seconds: int = 180,
+    timeout_seconds: int = 90,
 ) -> Snapshot:
     target = username(account)
-    deadline = time.monotonic() + max(30, min(int(timeout_seconds), 210))
-    session, cookies = _make_session(session_data)
+    deadline = time.monotonic() + max(20, min(int(timeout_seconds), 120))
+    session = _make_session()
     try:
-        before = _current_profile(session, cookies, target, deadline)
+        before = _profile(session, target, deadline)
+        if before["is_private"]:
+            raise InstagramDirectError("Приватный Instagram-аккаунт нельзя проверить без авторизации.")
+
         user_id = before["id"]
         following = _collect_relation(
-            session,
-            user_id,
-            "following",
-            before["following_count"],
-            deadline,
+            session, user_id, "following", before["following_count"], deadline
         )
         followers = _collect_relation(
-            session,
-            user_id,
-            "followers",
-            before["followers_count"],
-            deadline,
+            session, user_id, "followers", before["followers_count"], deadline
         )
-        after = _current_profile(session, cookies, target, deadline)
+        after = _profile(session, target, deadline)
+
         if after["id"] != user_id:
-            raise InstagramDirectError("Аккаунт изменился во время проверки. Запустите сбор ещё раз.")
+            raise InstagramDirectError("Аккаунт изменился во время проверки.")
         if (
             after["followers_count"] != before["followers_count"]
             or after["following_count"] != before["following_count"]
         ):
-            raise InstagramDirectError("Списки изменились прямо во время проверки. Запустите сбор ещё раз.")
+            raise InstagramDirectError("Списки изменились прямо во время проверки.")
         if len(followers) != before["followers_count"] or len(following) != before["following_count"]:
             raise InstagramDirectError("Получены неполные списки. Снимок не сохранён.")
+
         return Snapshot(
             target,
             datetime.now(timezone.utc).isoformat(),
@@ -338,7 +290,7 @@ def collect_snapshot_direct(
                 Sample("followers", "", followers, "id"),
                 Sample("following", "", following, "id"),
             ),
-            "instagram-device-direct",
+            "instagram-device-anonymous",
         )
     finally:
         session.close()
