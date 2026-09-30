@@ -67,7 +67,7 @@ never commit it or put it in the APK. The fallback can fail when Instagram limit
 
 Partial data is never returned as a valid snapshot.
 
-For `following`, incomplete results from the primary/free/public/session providers are merged with the two continuation-capable relationship fallbacks. If every provider is exhausted and Instagram consistently exposes exactly one fewer record than the unchanged profile count (for lists of at least 50), the backend saves the complete accessible list and reports the displayed Instagram count separately as `reported_following_count`; gaps of two or more are still rejected.
+For `following`, incomplete results from the primary/free/public/session providers are merged with the two continuation-capable relationship fallbacks before the snapshot is rejected.
 
 Both workers share the same request deadline, including profile rechecks, HTTP calls and
 retries. The backend stops an unfinished actor run if polling fails or the deadline expires,

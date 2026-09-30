@@ -430,7 +430,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual({item["id"] for item in result}, {str(i) for i in range(1, 111)})
         fallback.assert_called_once()
 
-    def test_relation_accepts_one_hidden_record_for_large_list(self):
+    def test_relation_rejects_one_hidden_record_for_large_list(self):
         exposed = [
             {"id": str(i), "username": f"user{i}"}
             for i in range(1, 110)
@@ -456,13 +456,14 @@ class ApiTests(unittest.TestCase):
             "_collect_relation_from_actor",
             return_value=exposed,
         ):
-            result = main._collect_relation(
-                "example",
-                110,
-                "Followings",
-                "Подписки",
-            )
-        self.assertEqual(len(result), 109)
+            with self.assertRaises(HTTPException) as error:
+                main._collect_relation(
+                    "example",
+                    110,
+                    "Followings",
+                    "Подписки",
+                )
+        self.assertEqual(error.exception.status_code, 409)
 
     def test_relation_rejects_two_hidden_records(self):
         exposed = [
@@ -698,37 +699,6 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(deadlines), 2)
         self.assertEqual(deadlines[0], deadlines[1])
-
-    def test_final_snapshot_accepts_single_hidden_following_record(self):
-        profile = {
-            "id": "123",
-            "username": "example",
-            "followers_count": 1,
-            "following_count": 110,
-            "is_private": False,
-        }
-
-        def relation(username, expected, data_type, label):
-            if data_type == "Followers":
-                return [{"id": "1", "username": "alice"}]
-            return [
-                {"id": str(i), "username": f"user{i}"}
-                for i in range(2, 111)
-            ]
-
-        with patch.object(main, "_profile", return_value=profile), patch.object(
-            main, "_collect_relation", side_effect=relation,
-        ):
-            response = self.client.post("/v1/collect", json={"username": "example"})
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["following_count"], 109)
-        self.assertEqual(payload["reported_following_count"], 110)
-        self.assertEqual(payload["following_accessible_gap"], 1)
-        self.assertEqual(len(payload["following"]), 109)
-        self.assertTrue(payload["complete"])
-        self.assertEqual(payload["source"], "apify-online-accessible")
 
     def test_final_snapshot_rejects_mismatched_lengths(self):
         profile = {"id": "123", "username": "example", "followers_count": 2, "following_count": 1, "is_private": False}
