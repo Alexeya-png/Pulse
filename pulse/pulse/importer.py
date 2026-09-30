@@ -15,6 +15,7 @@ MAX_TOTAL_JSON_BYTES = 128 * 1024 * 1024
 MAX_ZIP_ENTRIES = 20_000
 MAX_MEMBERS = 500_000
 FOLLOWER_FILE = re.compile(r"followers(?:_([1-9][0-9]*))?\.json\Z")
+FOLLOWING_FILE = re.compile(r"following\.json\Z")
 
 
 def _unique_object(pairs):
@@ -38,9 +39,10 @@ def _read_json(stream: BinaryIO):
         raise DataError("Не удалось прочитать JSON. Выберите выгрузку в формате JSON, не HTML.") from None
 
 
-def _export_members(data) -> list[Member]:
-    if isinstance(data, dict) and set(data) == {"relationships_followers"}:
-        data = data["relationships_followers"]
+def _export_members(data, relation: str = "followers") -> list[Member]:
+    key = "relationships_followers" if relation == "followers" else "relationships_following"
+    if isinstance(data, dict) and set(data) == {key}:
+        data = data[key]
     if not isinstance(data, list) or len(data) > MAX_MEMBERS:
         raise DataError("Ожидается список подписчиков из выгрузки Instagram.")
     members = []
@@ -116,12 +118,17 @@ def load_snapshot(path: str | Path, account: str, captured_at: str, *, export_co
             return _custom(data, account)
         if not export_complete:
             raise DataError("Подтвердите, что выбраны все части списка подписчиков за всё время.")
-        if not FOLLOWER_FILE.fullmatch(path.name):
-            raise DataError("Для выгрузки нужен followers.json, followers_1.json или ZIP со всеми частями. liked_posts.json содержит ваши лайки другим людям.")
-        match = FOLLOWER_FILE.fullmatch(path.name)
-        if match.group(1) not in (None, "1"):
+        follower_match = FOLLOWER_FILE.fullmatch(path.name)
+        following_match = FOLLOWING_FILE.fullmatch(path.name)
+        if not follower_match and not following_match:
+            raise DataError("Выберите followers.json, following.json или ZIP из выгрузки Instagram.")
+        if follower_match and follower_match.group(1) not in (None, "1"):
             raise DataError("Это отдельная часть списка. Импортируйте ZIP со всеми followers_N.json.")
-        return Snapshot(account, captured_at, (Sample("followers", "", _deduplicate(_export_members(data))),), "instagram_export")
+        if follower_match:
+            sample = Sample("followers", "", _deduplicate(_export_members(data, "followers")))
+        else:
+            sample = Sample("following", "", _deduplicate(_export_members(data, "following")))
+        return Snapshot(account, captured_at, (sample,), "instagram_export")
     except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError):
         raise DataError("ZIP повреждён, зашифрован или использует неподдерживаемое сжатие.") from None
 
@@ -133,30 +140,50 @@ def _load_zip(path: Path, account: str, captured_at: str, complete: bool) -> Sna
         infos = archive.infolist()
         if len(infos) > MAX_ZIP_ENTRIES:
             raise DataError("В ZIP слишком много файлов. Запросите только подписчиков, без медиа.")
-        selected = []
+        followers = []
+        following = []
+        following_entry = None
         for info in infos:
             name = PurePosixPath(info.filename.replace("\\", "/"))
-            match = FOLLOWER_FILE.fullmatch(name.name)
-            if not match:
+            follower_match = FOLLOWER_FILE.fullmatch(name.name)
+            following_match = FOLLOWING_FILE.fullmatch(name.name)
+            if not follower_match and not following_match:
                 continue
             if name.is_absolute() or ".." in name.parts or ":" in str(name):
                 raise DataError("Недопустимый путь внутри ZIP.")
             if info.file_size > MAX_JSON_BYTES or info.flag_bits & 1:
                 raise DataError("Часть выгрузки слишком велика или зашифрована.")
-            selected.append((info, name, int(match.group(1) or 0)))
-        if not selected:
-            raise DataError("В ZIP нет followers_N.json. Выберите JSON-выгрузку подписчиков.")
-        if len({str(name.parent) for _, name, _ in selected}) != 1:
-            raise DataError("В ZIP несколько папок подписчиков. Импортируйте один аккаунт за раз.")
-        numbers = sorted(n for _, _, n in selected)
-        if numbers != [0] and numbers != list(range(1, len(numbers) + 1)):
-            raise DataError("Нарушена последовательность followers_N.json: пропущена или повторена часть.")
-        if sum(info.file_size for info, _, _ in selected) > MAX_TOTAL_JSON_BYTES:
-            raise DataError("Списки подписчиков в ZIP превышают лимит 128 МиБ.")
-        members = []
-        for info, _, _ in sorted(selected, key=lambda row: row[2]):
+            if follower_match:
+                followers.append((info, name, int(follower_match.group(1) or 0)))
+            elif following_entry is None:
+                following_entry = (info, name)
+            else:
+                raise DataError("В ZIP найдено несколько following.json.")
+
+        if not followers and following_entry is None:
+            raise DataError("В ZIP нет followers_N.json или following.json.")
+
+        samples = []
+        if followers:
+            if len({str(name.parent) for _, name, _ in followers}) != 1:
+                raise DataError("В ZIP несколько папок подписчиков. Импортируйте один аккаунт за раз.")
+            numbers = sorted(n for _, _, n in followers)
+            if numbers != [0] and numbers != list(range(1, len(numbers) + 1)):
+                raise DataError("Нарушена последовательность followers_N.json: пропущена или повторена часть.")
+            if sum(info.file_size for info, _, _ in followers) > MAX_TOTAL_JSON_BYTES:
+                raise DataError("Списки подписчиков в ZIP превышают лимит 128 МиБ.")
+            members = []
+            for info, _, _ in sorted(followers, key=lambda row: row[2]):
+                with archive.open(info) as stream:
+                    members.extend(_export_members(_read_json(stream), "followers"))
+                if len(members) > MAX_MEMBERS:
+                    raise DataError("Лимит списка: 500 000 записей.")
+            samples.append(Sample("followers", "", _deduplicate(members)))
+
+        if following_entry is not None:
+            info, _ = following_entry
             with archive.open(info) as stream:
-                members.extend(_export_members(_read_json(stream)))
-            if len(members) > MAX_MEMBERS:
-                raise DataError("Лимит списка: 500 000 записей.")
-    return Snapshot(account, captured_at, (Sample("followers", "", _deduplicate(members)),), "instagram_export")
+                members = _export_members(_read_json(stream), "following")
+            samples.append(Sample("following", "", _deduplicate(members)))
+
+    return Snapshot(account, captured_at, tuple(samples), "instagram_export")
