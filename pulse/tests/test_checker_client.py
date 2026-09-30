@@ -114,7 +114,7 @@ class CheckerClientTests(unittest.TestCase):
         ), patch("pulse.checker_client.requests.post", return_value=response):
             with self.assertRaises(CheckerError) as error:
                 collect_snapshot("example")
-        self.assertIn("не совпало", str(error.exception).lower())
+        self.assertIn("неполный список подписчиков", str(error.exception).lower())
 
 
 if __name__ == "__main__":
