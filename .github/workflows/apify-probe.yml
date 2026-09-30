@@ -1,4 +1,4 @@
-name: Temporary Apify fallback discovery
+name: Temporary Apify fallback schema probe
 
 on:
   push:
@@ -13,63 +13,31 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
-      - name: Discover fallback actors
+      - name: Inspect selected fallback schemas
         run: |
           python - <<'PY'
           import json
-          from urllib.parse import quote
           from urllib.request import urlopen
 
           def get(url):
               with urlopen(url, timeout=30) as r:
                   return json.load(r)
 
-          query = quote("instagram followers following scraper")
-          store = get(f"https://api.apify.com/v2/store?search={query}&limit=50")
-          items = store.get("data", {}).get("items", [])
-          print("STORE_RESULTS")
-          for item in items:
-              username = item.get("username")
-              name = item.get("name")
-              if not username or not name:
-                  continue
-              actor = f"{username}~{name}"
-              print(json.dumps({
-                  "actor": actor,
-                  "title": item.get("title"),
-                  "description": item.get("description"),
-                  "pricing": item.get("currentPricingInfo"),
-                  "stats": item.get("stats"),
-              }, ensure_ascii=False))
-
-          candidates = [
-              "themineworks~instagram-followers-scraper",
-              "dead00~instagram-followers-following-scraper-no-cookies",
-              "coderx~instagram-followers-following-scraper-no-cookies-login",
-          ]
-          for actor in candidates:
+          for actor in [
+              "scrapesmith~instagram-followers-following-scraper",
+              "danek~instagram-followers-following-scraper",
+          ]:
               print("\n=== ACTOR", actor, "===")
-              try:
-                  meta = get(f"https://api.apify.com/v2/acts/{actor}")["data"]
-              except Exception as e:
-                  print("META_ERROR", repr(e))
-                  continue
+              meta = get(f"https://api.apify.com/v2/acts/{actor}")["data"]
               latest = meta.get("taggedBuilds", {}).get("latest", {})
               print("META", json.dumps({
                   "id": meta.get("id"),
-                  "username": meta.get("username"),
-                  "name": meta.get("name"),
-                  "title": meta.get("title"),
-                  "description": meta.get("description"),
-                  "pricingInfos": meta.get("pricingInfos"),
-                  "currentPricingInfo": meta.get("currentPricingInfo"),
                   "stats": meta.get("stats"),
+                  "pricingInfos": meta.get("pricingInfos"),
                   "latest": latest,
               }, ensure_ascii=False))
               build_id = latest.get("buildId")
-              if not build_id:
-                  continue
               build = get(f"https://api.apify.com/v2/actor-builds/{build_id}")["data"]
               print("INPUT_SCHEMA", build.get("inputSchema"))
-              print("README", (build.get("readme") or "")[:18000])
+              print("README", (build.get("readme") or "")[:20000])
           PY
