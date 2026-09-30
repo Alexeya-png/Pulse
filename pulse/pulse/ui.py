@@ -28,7 +28,6 @@ from kivy.utils import platform
 from .model import DataError, Member, Sample, Snapshot, username
 from .store import Store
 from .checker_client import collect_snapshot
-from .instagram_login import open_instagram_login
 
 BG = (0.047, 0.055, 0.078, 1)
 CARD = (0.09, 0.102, 0.137, 1)
@@ -167,8 +166,13 @@ class PulseApp(App):
             self.prefs = json.loads(self.config_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             self.prefs = {}
+        prefs_changed = False
         if self.prefs.get("export_pending"):
             self.prefs["export_pending"] = False
+            prefs_changed = True
+        if self.prefs.pop("instagram_session", None) is not None:
+            prefs_changed = True
+        if prefs_changed:
             self.save_prefs()
         self.real_store = Store(self.data_dir / "pulse.sqlite3")
         self.store = self.real_store
@@ -332,14 +336,10 @@ class PulseApp(App):
             self.target.focus = True
             return
 
-        if not self.prefs.get("instagram_session"):
-            self.start_instagram_login(account, collect_after=True)
-            return
-
-        self.message("Собираем полный список напрямую с Instagram через этот телефон…")
+        self.message("Собираем данные автоматически. Вход в Instagram не требуется…")
 
         def work():
-            snapshot = collect_snapshot(account, self.prefs.get("instagram_session"))
+            snapshot = collect_snapshot(account)
             changes = self.store.ingest(snapshot)
             return changes
 
@@ -455,45 +455,13 @@ class PulseApp(App):
     def login_dialog(self):
         self.collection_action()
 
-    def start_instagram_login(self, account=None, collect_after=False):
-        self.message("Откройте Instagram во встроенном окне и войдите в нужный аккаунт.")
-
-        def success(payload):
-            self.prefs["instagram_session"] = payload
-            self.save_prefs()
-            self.message("Вход Instagram сохранён только в приватном хранилище Pulse.")
-            if collect_after:
-                Clock.schedule_once(lambda _dt: self.collection_action(), 0)
-
-        def cancelled():
-            self.message("Вход Instagram отменён.")
-
-        try:
-            open_instagram_login(success, cancelled)
-        except Exception:
-            self.message("Встроенный вход Instagram доступен только в Android-приложении.")
-
     def settings_dialog(self):
-        logged_in = bool(self.prefs.get("instagram_session"))
-        login = Pill(
-            text="Перевойти в Instagram" if logged_in else "Войти в Instagram",
+        demo = Pill(
+            text="Выйти из демо" if self.demo_mode else "Посмотреть демо",
             size_hint_y=None,
             height=dp(43),
         )
-        forget = Pill(text="Забыть вход Instagram", size_hint_y=None, height=dp(43))
-        forget.disabled = not logged_in
-        demo = Pill(text="Выйти из демо" if self.demo_mode else "Посмотреть демо", size_hint_y=None, height=dp(43))
-        popup = self.modal("Настройки", [login, forget, demo], height=300)
-
-        def login_now(_):
-            popup.dismiss()
-            self.start_instagram_login()
-
-        def forget_login(_):
-            self.prefs.pop("instagram_session", None)
-            self.save_prefs()
-            popup.dismiss()
-            self.message("Сохранённый вход Instagram удалён из Pulse.")
+        popup = self.modal("Настройки", [demo], height=220)
 
         def show_demo(_):
             self.demo_mode = not self.demo_mode
@@ -507,15 +475,13 @@ class PulseApp(App):
             popup.dismiss()
             self.refresh()
 
-        login.bind(on_release=login_now)
-        forget.bind(on_release=forget_login)
         demo.bind(on_release=show_demo)
 
     def help_dialog(self):
         self.dialog(
             "Как работает Pulse",
-            "Введите свой Instagram-ник и нажмите «Собрать данные». При первом запуске Pulse откроет встроенный вход Instagram. После входа списки followers и following читаются напрямую с Instagram через этот телефон — без HikerAPI, Apify и других scraper-сервисов. Первый полный сбор сохраняется как точка отсчёта. Следующие сборы сравниваются с предыдущим и показывают отписки, новых подписчиков и невзаимные подписки.\n\n"
-            "Для точного результата войдите в тот же Instagram-аккаунт, который проверяете. Если Instagram возвращает неполный список или данные меняются во время проверки, Pulse не сохраняет такой снимок."
+            "Введите Instagram-ник и нажмите «Собрать данные». Вход в Instagram не нужен: Pulse сначала пробует получить публичные данные напрямую через сеть телефона, а если Instagram не отдаёт список анонимно — использует наш собственный backend collector. HikerAPI, Apify и сторонние scraper-сервисы не используются. Первый полный сбор сохраняется как точка отсчёта. Следующие сборы сравниваются с предыдущим и показывают отписки, новых подписчиков и невзаимные подписки.\n\n"
+            "Пароль, cookies и Instagram-сессия пользователя не запрашиваются и не сохраняются. Неполный список не сохраняется как корректный снимок."
         )
 
     def on_pause(self):
