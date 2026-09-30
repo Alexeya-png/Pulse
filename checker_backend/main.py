@@ -6,23 +6,21 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 
+import instaloader
 from fastapi import FastAPI, HTTPException
-from instagrapi import Client
 from pydantic import BaseModel
 
-app = FastAPI(title="Pulse Checker", version="0.2.0")
+app = FastAPI(title="Pulse Checker", version="0.1.1")
 logger = logging.getLogger("pulse.checker")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
-SESSION_FILE = Path("/tmp/pulse-instagram-session.json")
 
 _collect_lock = threading.Lock()
-_client_lock = threading.Lock()
-_client = None
-_client_username = None
+_loader_lock = threading.Lock()
+_loader = None
+_loader_username = None
 
 
 class CollectRequest(BaseModel):
@@ -36,138 +34,131 @@ def _normal_username(value: str) -> str:
     return value
 
 
-def _load_env_session(client: Client) -> bool:
-    raw = os.environ.get("IG_SESSION_JSON", "").strip()
-    if not raw:
-        return False
-    try:
-        settings = json.loads(raw)
-        if not isinstance(settings, dict):
-            raise ValueError
-        client.set_settings(settings)
-        return True
-    except Exception:
-        raise HTTPException(503, "IG_SESSION_JSON имеет неверный формат.") from None
-
-
-def _make_client() -> Client:
+def _make_loader() -> instaloader.Instaloader:
     username = os.environ.get("IG_CHECKER_USERNAME", "").strip().lower()
-    password = os.environ.get("IG_CHECKER_PASSWORD", "").strip()
     if not username:
         raise HTTPException(503, "Проверяющий Instagram-аккаунт ещё не настроен.")
-    if not password and not os.environ.get("IG_SESSION_JSON", "").strip():
-        raise HTTPException(
-            503,
-            "Для проверяющего аккаунта нужен IG_CHECKER_PASSWORD или IG_SESSION_JSON.",
-        )
 
-    client = Client()
-    loaded_session = False
+    loader = instaloader.Instaloader(
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False,
+        quiet=True,
+        max_connection_attempts=1,
+        request_timeout=30.0,
+    )
+
+    session_json = os.environ.get("IG_SESSION_JSON", "").strip()
+    password = os.environ.get("IG_CHECKER_PASSWORD", "").strip()
 
     try:
-        if SESSION_FILE.exists():
-            client.load_settings(SESSION_FILE)
-            loaded_session = True
-        elif _load_env_session(client):
-            loaded_session = True
-
-        if password:
-            client.login(username, password)
+        if session_json:
+            session = json.loads(session_json)
+            if not isinstance(session, dict):
+                raise ValueError
+            loader.load_session(username, session)
+        elif password:
+            loader.login(username, password)
         else:
-            # A saved session can be reused without exposing the password to the app.
-            if not loaded_session:
-                raise HTTPException(503, "Сессия Instagram не настроена.")
-            sessionid = (client.get_settings().get("cookies") or {}).get("sessionid")
-            if not sessionid:
-                raise HTTPException(503, "IG_SESSION_JSON не содержит рабочую Instagram-сессию.")
-            client.login_by_sessionid(sessionid)
+            raise HTTPException(
+                503,
+                "Для проверяющего аккаунта нужен IG_SESSION_JSON или IG_CHECKER_PASSWORD.",
+            )
 
-        try:
-            client.dump_settings(SESSION_FILE)
-        except Exception:
-            pass
-
-        return client
+        logged_in_as = loader.test_login()
+        if not logged_in_as or logged_in_as.lower() != username:
+            raise HTTPException(503, "Instagram-сессия проверяющего аккаунта недействительна.")
     except HTTPException:
         raise
-    except Exception as exc:
-        name = exc.__class__.__name__
-        message = str(exc or "")
-        safe = message.replace(password, "***") if password else message
-        logger.warning("Instagram checker login failed: %s: %s", name, safe[:500])
-
-        lower = (name + " " + message).lower()
-        if "twofactor" in lower or "2fa" in lower:
-            raise HTTPException(
-                503,
-                "Instagram требует 2FA. Нужна заранее сохранённая IG_SESSION_JSON.",
-            ) from None
-        if "challenge" in lower or "checkpoint" in lower:
-            raise HTTPException(
-                503,
-                "Instagram запросил подтверждение входа. Подтвердите checker-аккаунт в официальном Instagram и повторите.",
-            ) from None
-        if "please wait" in lower or "rate" in lower or "429" in lower:
-            raise HTTPException(
-                429,
-                "Instagram временно ограничил checker-аккаунт. Не повторяйте вход несколько минут.",
-            ) from None
-        if "badpassword" in lower or "bad password" in lower:
-            raise HTTPException(503, "Неверный пароль checker-аккаунта.") from None
+    except instaloader.exceptions.TwoFactorAuthRequiredException:
         raise HTTPException(
             503,
-            "Instagram не разрешил войти checker-аккаунту.",
+            "Instagram запросил 2FA. Создайте сессию один раз и задайте IG_SESSION_JSON.",
         ) from None
+    except instaloader.exceptions.BadCredentialsException:
+        raise HTTPException(503, "Неверные данные проверяющего Instagram-аккаунта.") from None
+    except instaloader.exceptions.InstaloaderException as exc:
+        message = str(exc or "")
+        safe_message = message.replace(password, "***") if password else message
+        logger.warning(
+            "Instagram checker login failed: %s: %s",
+            exc.__class__.__name__,
+            safe_message[:500],
+        )
+        lower = message.lower()
+        if "checkpoint" in lower or "challenge" in lower:
+            raise HTTPException(
+                503,
+                "Instagram запросил подтверждение входа/checkpoint. Откройте checker-аккаунт в Instagram, подтвердите вход и затем повторите проверку. Если повторяется — используйте IG_SESSION_JSON.",
+            ) from None
+        if "two-factor" in lower or "2fa" in lower:
+            raise HTTPException(
+                503,
+                "Instagram требует 2FA. Для этого аккаунта нужен IG_SESSION_JSON.",
+            ) from None
+        if "login" in lower and ("required" in lower or "please wait" in lower):
+            raise HTTPException(
+                503,
+                "Instagram временно не принимает серверный вход. Подтвердите вход в самом Instagram и попробуйте снова.",
+            ) from None
+        raise HTTPException(
+            503,
+            "Instagram отклонил серверный вход. Для стабильной работы нужен IG_SESSION_JSON, созданный после обычного входа в аккаунт.",
+        ) from None
+    except (ValueError, TypeError, json.JSONDecodeError):
+        raise HTTPException(503, "IG_SESSION_JSON имеет неверный формат.") from None
+
+    return loader
 
 
-def _get_client() -> Client:
-    global _client, _client_username
+def _get_loader() -> instaloader.Instaloader:
+    global _loader, _loader_username
     configured_username = os.environ.get("IG_CHECKER_USERNAME", "").strip().lower()
-    with _client_lock:
-        if _client is None or _client_username != configured_username:
-            _client = _make_client()
-            _client_username = configured_username
-        return _client
+    with _loader_lock:
+        if _loader is None or _loader_username != configured_username:
+            _loader = _make_loader()
+            _loader_username = configured_username
+        return _loader
 
 
-def _invalidate_client() -> None:
-    global _client, _client_username
-    with _client_lock:
-        _client = None
-        _client_username = None
-    try:
-        SESSION_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
+def _invalidate_loader() -> None:
+    global _loader, _loader_username
+    with _loader_lock:
+        _loader = None
+        _loader_username = None
 
 
-def _member(row) -> dict:
-    user_id = str(getattr(row, "pk"))
-    value = str(getattr(row, "username")).lower()
-    return {"id": user_id, "username": value}
+def _collect_members(iterator, expected: int, label: str) -> list[dict]:
+    if expected > MAX_MEMBERS:
+        raise HTTPException(413, f"{label}: список больше лимита сервера.")
 
-
-def _collect_list(iterator, expected: int | None, label: str) -> list[dict]:
     result = {}
     try:
-        for row in iterator:
-            member = _member(row)
-            result[member["id"]] = member
+        for profile in iterator:
+            user_id = str(profile.userid)
+            result[user_id] = {
+                "id": user_id,
+                "username": profile.username.lower(),
+            }
             if len(result) > MAX_MEMBERS:
                 raise HTTPException(413, f"{label}: список больше лимита сервера.")
     except HTTPException:
         raise
-    except Exception as exc:
-        name = exc.__class__.__name__.lower()
-        message = str(exc or "").lower()
-        if "loginrequired" in name or "login_required" in message:
-            _invalidate_client()
-            raise HTTPException(503, "Сессия checker-аккаунта истекла.") from None
-        if "ratelimit" in name or "please wait" in message or "429" in message:
-            raise HTTPException(429, "Instagram временно ограничил проверку. Попробуйте позже.") from None
-        raise HTTPException(502, f"{label}: Instagram прервал получение списка. Снимок не сохранён.") from None
+    except instaloader.exceptions.LoginRequiredException:
+        _invalidate_loader()
+        raise HTTPException(503, "Сессия проверяющего аккаунта истекла.") from None
+    except instaloader.exceptions.TooManyRequestsException:
+        raise HTTPException(429, "Instagram временно ограничил проверки. Попробуйте позже.") from None
+    except instaloader.exceptions.ConnectionException:
+        raise HTTPException(502, "Instagram прервал получение списка. Снимок не сохранён.") from None
+    except instaloader.exceptions.InstaloaderException:
+        raise HTTPException(502, "Не удалось полностью получить список Instagram.") from None
 
-    if expected is not None and len(result) != expected:
+    if len(result) != expected:
         raise HTTPException(
             409,
             f"{label}: Instagram отдал не весь список ({len(result)} из {expected}). Снимок не сохранён.",
@@ -182,7 +173,6 @@ def health():
         "checker_configured": bool(os.environ.get("IG_CHECKER_USERNAME")),
         "has_password": bool(os.environ.get("IG_CHECKER_PASSWORD")),
         "has_session": bool(os.environ.get("IG_SESSION_JSON")),
-        "engine": "instagrapi-mobile",
     }
 
 
@@ -194,63 +184,44 @@ def collect(request: CollectRequest):
         raise HTTPException(429, "Сейчас уже выполняется другая проверка. Попробуйте позже.")
 
     try:
-        client = _get_client()
-
+        loader = _get_loader()
         try:
-            info = client.user_info_by_username(target)
-        except Exception as exc:
-            name = exc.__class__.__name__.lower()
-            message = str(exc or "").lower()
-            if "usernotfound" in name or "not found" in message:
-                raise HTTPException(404, "Instagram-аккаунт не найден.") from None
-            if "loginrequired" in name or "login_required" in message:
-                _invalidate_client()
-                raise HTTPException(503, "Сессия checker-аккаунта истекла.") from None
-            raise HTTPException(502, "Instagram не отдал профиль для проверки.") from None
+            before = instaloader.Profile.from_username(loader.context, target)
+        except instaloader.exceptions.ProfileNotExistsException:
+            raise HTTPException(404, "Instagram-аккаунт не найден.") from None
+        except instaloader.exceptions.LoginRequiredException:
+            _invalidate_loader()
+            raise HTTPException(503, "Сессия проверяющего аккаунта истекла.") from None
+        except instaloader.exceptions.ConnectionException:
+            raise HTTPException(502, "Instagram временно недоступен.") from None
 
-        user_id = str(info.pk)
-        expected_followers = getattr(info, "follower_count", None)
-        expected_following = getattr(info, "following_count", None)
-        if expected_followers is not None:
-            expected_followers = int(expected_followers)
-        if expected_following is not None:
-            expected_following = int(expected_following)
-
-        if expected_followers is not None and expected_followers > MAX_MEMBERS:
-            raise HTTPException(413, "Подписчики: список больше лимита сервера.")
-        if expected_following is not None and expected_following > MAX_MEMBERS:
-            raise HTTPException(413, "Подписки: список больше лимита сервера.")
-
-        followers = _collect_list(
-            client.iter_user_followers_v1(user_id, amount=0, page_size=200),
-            expected_followers,
-            "Подписчики",
-        )
-        following = _collect_list(
-            client.iter_user_following_v1(user_id, amount=0, page_size=200),
-            expected_following,
-            "Подписки",
-        )
-
-        try:
-            after = client.user_info(user_id)
-        except Exception:
+        if before.is_private and not before.followed_by_viewer:
             raise HTTPException(
-                502,
-                "Не удалось подтвердить полноту снимка. Снимок не сохранён.",
+                403,
+                "Аккаунт приватный. Проверяющий аккаунт должен быть его подписчиком.",
+            )
+
+        before_followers = int(before.followers)
+        before_following = int(before.followees)
+
+        followers = _collect_members(
+            before.get_followers(), before_followers, "Подписчики"
+        )
+        following = _collect_members(
+            before.get_followees(), before_following, "Подписки"
+        )
+
+        try:
+            after = instaloader.Profile.from_username(loader.context, target)
+        except instaloader.exceptions.InstaloaderException:
+            raise HTTPException(
+                502, "Не удалось подтвердить полноту снимка. Снимок не сохранён."
             ) from None
 
-        after_followers = getattr(after, "follower_count", None)
-        after_following = getattr(after, "following_count", None)
-
         if (
-            expected_followers is not None
-            and after_followers is not None
-            and int(after_followers) != expected_followers
-        ) or (
-            expected_following is not None
-            and after_following is not None
-            and int(after_following) != expected_following
+            str(after.userid) != str(before.userid)
+            or int(after.followers) != before_followers
+            or int(after.followees) != before_following
         ):
             raise HTTPException(
                 409,
@@ -259,10 +230,10 @@ def collect(request: CollectRequest):
 
         return {
             "account": target,
-            "account_id": user_id,
+            "account_id": str(before.userid),
             "captured_at": datetime.now(timezone.utc).isoformat(),
-            "followers_count": expected_followers,
-            "following_count": expected_following,
+            "followers_count": before_followers,
+            "following_count": before_following,
             "followers": followers,
             "following": following,
             "complete": True,
