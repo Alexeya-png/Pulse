@@ -4,7 +4,7 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 
@@ -25,10 +25,9 @@ from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
 from kivy.utils import platform
 
-from .instagram import InstagramReader, SyncError, make_client, safe_error
 from .model import DataError, Member, Sample, Snapshot, username
 from .store import Store
-from .vault import SessionVault
+from .importer import load_snapshot
 
 BG = (0.047, 0.055, 0.078, 1)
 CARD = (0.09, 0.102, 0.137, 1)
@@ -138,6 +137,7 @@ class PulseApp(App):
         self.screenshot = screenshot
         self.client = None
         self.web_login = None
+        self.file_picker = None
         self.history_all = False
         self.busy = False
         self.cancel = Event()
@@ -160,7 +160,6 @@ class PulseApp(App):
             self.prefs = json.loads(self.config_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             self.prefs = {}
-        self.vault = SessionVault(self.data_dir / "session.enc", platform == "android")
         self.real_store = Store(self.data_dir / "pulse.sqlite3")
         self.store = self.real_store
         if self.demo_mode:
@@ -196,9 +195,9 @@ class PulseApp(App):
             stats.add_widget(card)
             self.stats.append(value)
         root.add_widget(stats)
-        self.sync_btn = Pill(text="Импортировать выгрузку", fill=LIME, color=BG, bold=True, size_hint_y=None, height=dp(48), on_release=lambda *_: self.import_export())
+        self.sync_btn = Pill(text="Собрать данные", fill=LIME, color=BG, bold=True, size_hint_y=None, height=dp(48), on_release=lambda *_: self.collection_action())
         root.add_widget(self.sync_btn)
-        self.status = label("Импортируйте ZIP/JSON выгрузки Instagram.", size=12, color=MUTED, height=54)
+        self.status = label("Первый сбор сохранит точку отсчёта. Следующий покажет изменения.", size=12, color=MUTED, height=54)
         root.add_widget(self.status)
         tabs = BoxLayout(size_hint_y=None, height=dp(37), spacing=dp(6))
         self.tabs = []
@@ -227,9 +226,8 @@ class PulseApp(App):
         pager.add_widget(self.next_btn)
         root.add_widget(pager)
         footer = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(8))
-        self.connect_btn = Pill(text="Импортировать данные", on_release=lambda *_: self.import_export())
+        self.connect_btn = Pill(text="Как работает", on_release=lambda *_: self.help_dialog())
         footer.add_widget(self.connect_btn)
-        footer.add_widget(Pill(text="Как работает", on_release=lambda *_: self.help_dialog()))
         root.add_widget(footer)
         self.refresh()
         Clock.schedule_interval(self.auto_tick, 30)
@@ -292,13 +290,54 @@ class PulseApp(App):
         future.add_done_callback(lambda _: Clock.schedule_once(complete))
 
     def restore_session(self):
-        return
+        self._update_collection_button()
 
     def sync(self):
-        self.import_export()
+        self.collection_action()
 
     def auto_tick(self, _):
         return
+
+    def _update_collection_button(self):
+        if not hasattr(self, "sync_btn"):
+            return
+        if self.prefs.get("export_pending"):
+            self.sync_btn.text = "Выбрать готовый ZIP"
+            return
+        try:
+            account = username(self.target.text)
+            has_baseline = bool(self.store.summary(account).get("last_seen"))
+        except Exception:
+            has_baseline = False
+        self.sync_btn.text = "Собрать снова и проверить" if has_baseline else "Собрать данные"
+
+    def collection_action(self):
+        if self.busy or self.file_picker:
+            return
+        try:
+            username(self.target.text)
+        except DataError:
+            self.message("Сначала укажите Instagram-ник.")
+            self.target.focus = True
+            return
+        if self.prefs.get("export_pending"):
+            self.import_export()
+            return
+        if platform != "android":
+            self.message("Сбор через Instagram доступен в Android-приложении.")
+            return
+        try:
+            from .android_import import open_instagram_export
+            self.prefs["export_pending"] = True
+            self.save_prefs()
+            self._update_collection_button()
+            self.message("В Instagram выберите Followers and following → JSON → All time. Когда ZIP будет готов и скачан, вернитесь в Pulse и нажмите эту же кнопку.")
+            open_instagram_export()
+        except Exception:
+            self.prefs["export_pending"] = False
+            self.save_prefs()
+            self._update_collection_button()
+            self.message("Не удалось открыть экспорт Instagram.")
 
     def refresh(self):
         if not hasattr(self, "rv"):
@@ -339,8 +378,12 @@ class PulseApp(App):
                 detail = "По последним сохранённым спискам." if reciprocal["ready"] else "Нужны подписчики и подписки из одной проверки."
             self.rv.data = [{"title": title, "detail": detail, "badge": "·", "tint": MUTED}]
         self.rv.scroll_y = 1
-        if not self.busy:
-            self.message(("Демо · вымышленные данные\n" if self.demo_mode else "") + f"Последние данные: {short_date(stats['last_seen'])}")
+        self._update_collection_button()
+        if not self.busy and not self.prefs.get("export_pending"):
+            if stats["last_seen"]:
+                self.message(("Демо · вымышленные данные\n" if self.demo_mode else "") + f"Последние данные: {short_date(stats['last_seen'])}")
+            else:
+                self.message("Первый сбор сохранит точку отсчёта. Следующий покажет изменения.")
 
     def set_filter(self, filt):
         self.filter, self.cursor, self.page_stack = filt, None, []
@@ -391,16 +434,16 @@ class PulseApp(App):
         try:
             account = username(self.target.text)
         except DataError:
-            self.message("Сначала укажите имя аккаунта.")
+            self.message("Сначала укажите Instagram-ник.")
             self.target.focus = True
             return
         if platform != "android":
-            self.message("Импорт файла доступен в Android-приложении.")
+            self.message("Импорт ZIP доступен в Android-приложении.")
             return
 
         self.target.disabled = self.settings_btn.disabled = self.connect_btn.disabled = True
         self.sync_btn.disabled = True
-        self.message("Выберите ZIP или JSON выгрузки Instagram…")
+        self.message("Выберите скачанный ZIP Instagram…")
 
         def unlock():
             self.file_picker = None
@@ -409,7 +452,7 @@ class PulseApp(App):
 
         def cancelled():
             unlock()
-            self.message("Импорт отменён.")
+            self.message("Выбор файла отменён. Когда ZIP будет готов, нажмите кнопку ещё раз.")
 
         def failed(message):
             unlock()
@@ -421,23 +464,29 @@ class PulseApp(App):
 
             def work():
                 snapshot = load_snapshot(path, account, captured_at, export_complete=True)
+                kinds = {sample.kind for sample in snapshot.samples}
+                if not {"followers", "following"} <= kinds:
+                    raise DataError("В ZIP нужны оба списка: followers и following.")
                 changes = self.store.ingest(snapshot)
-                return changes, {sample.kind for sample in snapshot.samples}
+                return changes
 
-            def done(result):
-                changes, kinds = result
+            def done(changes):
                 self.prefs["target"] = account
+                self.prefs["export_pending"] = False
                 self.save_prefs()
                 self.cursor, self.page_stack = None, []
                 self.refresh()
+                summary = self.store.summary(account)
                 if changes.baselines and not changes.compared:
-                    text = "Точка отсчёта сохранена."
+                    self.message("Первый сбор сохранён. Позже нажмите «Собрать снова и проверить».")
                 else:
-                    summary = self.store.summary(account)
-                    text = f"Импортировано. Отписок: {summary['latest_unfollowers']}."
-                if "following" not in kinds:
-                    text += " В выгрузке нет following.json — невзаимные подписки не обновлены."
-                self.message(text)
+                    unfollowers = summary["latest_unfollowers"]
+                    nonreciprocal = summary["nonreciprocal"]
+                    self.message(
+                        f"Проверено. Отписались: {unfollowers if unfollowers is not None else 0}. "
+                        f"Не подписаны взаимно: {nonreciprocal if nonreciprocal is not None else 0}."
+                    )
+                self._update_collection_button()
 
             self.submit(work, done)
 
@@ -448,7 +497,7 @@ class PulseApp(App):
             failed("Не удалось открыть выбор файла.")
 
     def login_dialog(self):
-        self.import_export()
+        self.collection_action()
 
     def settings_dialog(self):
         demo = Pill(text="Выйти из демо" if self.demo_mode else "Посмотреть демо", size_hint_y=None, height=dp(43))
@@ -471,7 +520,10 @@ class PulseApp(App):
     def help_dialog(self):
         self.dialog(
             "Как работает Pulse",
-            "Импортируйте ZIP или JSON из выгрузки Instagram. Первый импорт — точка отсчёта. Следующий импорт покажет отписки, новые и невзаимные подписки."
+            "1. Нажмите «Собрать данные». Pulse откроет официальный экспорт Instagram.\n\n"
+            "2. Выберите Followers and following, JSON и All time. Скачайте готовый ZIP.\n\n"
+            "3. Вернитесь в Pulse и нажмите ту же кнопку, затем выберите ZIP. Первый сбор станет точкой отсчёта.\n\n"
+            "4. Позже нажмите «Собрать снова и проверить», получите новый ZIP и выберите его. Pulse сравнит два сбора и покажет отписки, новых и невзаимные подписки."
         )
 
     def on_pause(self):
@@ -481,6 +533,9 @@ class PulseApp(App):
 
     def on_resume(self):
         self.paused = False
+        if self.prefs.get("export_pending"):
+            self._update_collection_button()
+            self.message("Если ZIP уже готов и скачан, нажмите «Выбрать готовый ZIP».")
 
     def on_stop(self):
         self.stopping = True
