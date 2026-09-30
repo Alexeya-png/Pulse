@@ -28,7 +28,7 @@ jobs:
               headers={
                   "Content-Type":"application/json",
                   "Accept":"application/json",
-                  "User-Agent":"Pulse-Live-Smoke/1.0",
+                  "User-Agent":"Pulse-Live-Smoke/1.1",
               },
               method="POST",
           )
