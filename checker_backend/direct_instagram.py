@@ -617,5 +617,5 @@ def collect_direct_snapshot(
             "followers": followers,
             "following": following,
             "complete": True,
-            "source": "pulse-direct-fallback",
+            "source": "pulse-direct-server",
         }
