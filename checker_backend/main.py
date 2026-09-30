@@ -33,10 +33,15 @@ APIFY_SESSION_ACTOR = os.environ.get(
     "APIFY_SESSION_ACTOR",
     "dami_studio~instagram-followers-following-scraper",
 )
+APIFY_OFFICIAL_RELATION_ACTOR = os.environ.get(
+    "APIFY_OFFICIAL_RELATION_ACTOR",
+    "apify~instagram-followers-following-scraper",
+)
 APIFY_PAGE_SIZE = min(1000, max(1, int(os.environ.get("APIFY_PAGE_SIZE", "1000"))))
 APIFY_POLL_SECONDS = max(0.2, float(os.environ.get("APIFY_POLL_SECONDS", "1.5")))
 APIFY_RUN_TIMEOUT = max(30, int(os.environ.get("APIFY_RUN_TIMEOUT", "150")))
-APIFY_RELATION_ATTEMPTS = max(1, min(5, int(os.environ.get("APIFY_RELATION_ATTEMPTS", "3"))))
+APIFY_RELATION_ATTEMPTS = max(1, min(5, int(os.environ.get("APIFY_RELATION_ATTEMPTS", "1"))))
+APIFY_SESSION_ATTEMPTS = max(1, min(2, int(os.environ.get("APIFY_SESSION_ATTEMPTS", "1"))))
 APIFY_RETRY_DELAY = max(0.0, float(os.environ.get("APIFY_RETRY_DELAY", "2.0")))
 TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"}
 _collect_lock = threading.Lock()
@@ -357,6 +362,12 @@ def _collect_session_actor(
         "maxAttempts": 12,
         "proxyConfiguration": {"useApifyProxy": True},
     }
+    if list_type == "following":
+        body.update({
+            "requestTimeoutSeconds": 20,
+            "maxRunSeconds": 90,
+            "maxAttempts": 4,
+        })
     sessionid = _checker_sessionid()
     if list_type == "following":
         if not sessionid:
@@ -394,7 +405,13 @@ def _collect_session_actor(
             found[member["id"]] = member
             continue
         if row.get("ok") is False:
-            code = str(row.get("code") or "UNKNOWN")[:64]
+            code = str(
+                row.get("code")
+                or row.get("error")
+                or row.get("message")
+                or row.get("status")
+                or "UNKNOWN"
+            )[:96]
             diagnostic_codes.append(code)
 
     if diagnostic_codes:
@@ -405,6 +422,65 @@ def _collect_session_actor(
         )
     logger.info(
         "Apify session actor returned %d/%d for %s",
+        len(found),
+        expected,
+        label,
+    )
+    return list(found.values())
+
+
+def _collect_official_actor(
+    username: str,
+    expected: int,
+    data_type: str,
+    label: str,
+) -> list[dict]:
+    list_type = (
+        "followers"
+        if data_type.strip().lower() in {"follower", "followers"}
+        else "following"
+    )
+    run = _start_actor(
+        APIFY_OFFICIAL_RELATION_ACTOR,
+        {
+            "usernames": [username],
+            "dataToScrape": list_type,
+            "resultsLimit": expected,
+        },
+    )
+    run = _wait_run(str(run["id"]))
+    dataset_id = run.get("defaultDatasetId")
+    if not dataset_id:
+        raise HTTPException(
+            502,
+            f"{label}: public-provider не создал результат.",
+        )
+
+    rows = _dataset_items(str(dataset_id))
+    found: dict[str, dict] = {}
+    errors: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("error"):
+            errors.append(str(row.get("error"))[:96])
+            continue
+        member = _member(row, username, data_type)
+        found[member["id"]] = member
+        if len(found) > expected:
+            raise HTTPException(
+                409,
+                f"{label}: список изменился во время проверки. Снимок не сохранён.",
+            )
+
+    if errors:
+        logger.warning(
+            "Apify public actor diagnostics for %s: %s",
+            label,
+            ",".join(sorted(set(errors))),
+        )
+    logger.info(
+        "Apify public actor returned %d/%d for %s",
         len(found),
         expected,
         label,
@@ -505,9 +581,39 @@ def _collect_relation(
         return []
 
     combined: dict[str, dict] = {}
+    normalized_type = data_type.strip().lower()
+    is_following = normalized_type in {"following", "followings"}
+
+    if is_following and APIFY_OFFICIAL_RELATION_ACTOR:
+        try:
+            result = _collect_official_actor(
+                username,
+                expected,
+                data_type,
+                label,
+            )
+        except HTTPException as exc:
+            if exc.status_code in (401, 403, 429):
+                raise
+            logger.warning(
+                "Apify public actor failed for %s (%d)",
+                label,
+                exc.status_code,
+            )
+            result = []
+
+        for member in result:
+            combined[member["id"]] = member
+        if len(combined) > expected:
+            raise HTTPException(
+                409,
+                f"{label}: данные изменились во время сбора. Снимок не сохранён.",
+            )
+        if len(combined) == expected:
+            return list(combined.values())
 
     if APIFY_SESSION_ACTOR and expected <= 1000:
-        for attempt in range(APIFY_RELATION_ATTEMPTS):
+        for attempt in range(APIFY_SESSION_ATTEMPTS):
             try:
                 result = _collect_session_actor(
                     username,
@@ -542,8 +648,14 @@ def _collect_relation(
                 len(combined),
                 expected,
             )
-            if attempt + 1 < APIFY_RELATION_ATTEMPTS and APIFY_RETRY_DELAY:
+            if attempt + 1 < APIFY_SESSION_ATTEMPTS and APIFY_RETRY_DELAY:
                 time.sleep(APIFY_RETRY_DELAY)
+
+    if is_following:
+        raise HTTPException(
+            409,
+            f"{label}: получено {len(combined)} из {expected}. Снимок не сохранён.",
+        )
 
     providers = [
         (
@@ -607,16 +719,6 @@ def _collect_relation(
             if attempt + 1 < APIFY_RELATION_ATTEMPTS and APIFY_RETRY_DELAY:
                 time.sleep(APIFY_RETRY_DELAY)
 
-    missing = expected - len(combined)
-    if expected >= 50 and missing == 1:
-        logger.warning(
-            "%s: Instagram exposes %d/%d records; accepting complete accessible list",
-            label,
-            len(combined),
-            expected,
-        )
-        return list(combined.values())
-
     raise HTTPException(
         409,
         f"{label}: получено {len(combined)} из {expected}. Снимок не сохранён.",
@@ -640,17 +742,17 @@ def _collect_profile(target: str) -> dict:
         following_count,
     )
 
-    followers = _collect_relation(
-        target,
-        followers_count,
-        "Followers",
-        "Подписчики",
-    )
     following = _collect_relation(
         target,
         following_count,
         "Followings",
         "Подписки",
+    )
+    followers = _collect_relation(
+        target,
+        followers_count,
+        "Followers",
+        "Подписчики",
     )
 
     after = _profile(target)

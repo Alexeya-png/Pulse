@@ -213,23 +213,55 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(result, [{"id": "1", "username": "alice"}])
         self.assertNotIn("sessionCookies", captured["body"])
 
-    def test_relation_wrapper_uses_session_provider_first(self):
-        session_rows = [
+    def test_official_actor_following_uses_public_schema(self):
+        run = {"id": "r1", "defaultDatasetId": "d1"}
+        rows = [{
+            "sourceUsername": "example",
+            "userId": "1",
+            "username": "Alice",
+            "type": "FOLLOWING",
+        }]
+        captured = {}
+
+        def start(actor, body):
+            captured["actor"] = actor
+            captured["body"] = body
+            return run
+
+        with patch.object(main, "_start_actor", side_effect=start), \
+                patch.object(main, "_wait_run", return_value=run), \
+                patch.object(main, "_dataset_items", return_value=rows):
+            result = main._collect_official_actor(
+                "example",
+                1,
+                "Followings",
+                "Подписки",
+            )
+
+        self.assertEqual(result, [{"id": "1", "username": "alice"}])
+        self.assertEqual(captured["actor"], main.APIFY_OFFICIAL_RELATION_ACTOR)
+        self.assertEqual(captured["body"], {
+            "usernames": ["example"],
+            "dataToScrape": "following",
+            "resultsLimit": 1,
+        })
+
+    def test_following_uses_public_provider_first(self):
+        public_rows = [
             {"id": "1", "username": "alice"},
             {"id": "2", "username": "bob"},
         ]
         with patch.object(
             main,
+            "_collect_official_actor",
+            return_value=public_rows,
+        ) as public_collect, patch.object(
+            main,
             "_collect_session_actor",
-            return_value=session_rows,
         ) as session_collect, patch.object(
             main,
             "_collect_relation_from_actor",
-        ) as fallback_collect, patch.object(
-            main,
-            "APIFY_RELATION_ATTEMPTS",
-            1,
-        ):
+        ) as fallback_collect:
             result = main._collect_relation(
                 "example",
                 2,
@@ -238,12 +270,13 @@ class ApiTests(unittest.TestCase):
             )
 
         self.assertEqual(len(result), 2)
-        session_collect.assert_called_once_with(
+        public_collect.assert_called_once_with(
             "example",
             2,
             "Followings",
             "Подписки",
         )
+        session_collect.assert_not_called()
         fallback_collect.assert_not_called()
 
 
@@ -288,31 +321,28 @@ class ApiTests(unittest.TestCase):
             {"1", "2", "3"},
         )
 
-    def test_relation_accepts_exactly_one_hidden_record_for_large_list(self):
+    def test_relation_rejects_one_hidden_record_for_large_list(self):
         exposed = [
             {"id": str(i), "username": f"user{i}"}
             for i in range(1, 110)
         ]
         with patch.object(
             main,
-            "_collect_session_actor",
-            return_value=[],
-        ), patch.object(
-            main,
-            "_collect_relation_from_actor",
+            "_collect_official_actor",
             return_value=exposed,
         ), patch.object(
             main,
-            "APIFY_RELATION_ATTEMPTS",
-            1,
+            "_collect_session_actor",
+            return_value=[],
         ):
-            result = main._collect_relation(
-                "example",
-                110,
-                "Followings",
-                "Подписки",
-            )
-        self.assertEqual(len(result), 109)
+            with self.assertRaises(HTTPException) as error:
+                main._collect_relation(
+                    "example",
+                    110,
+                    "Followings",
+                    "Подписки",
+                )
+        self.assertEqual(error.exception.status_code, 409)
 
     def test_relation_rejects_two_hidden_records(self):
         exposed = [
@@ -321,16 +351,12 @@ class ApiTests(unittest.TestCase):
         ]
         with patch.object(
             main,
-            "_collect_session_actor",
-            return_value=[],
-        ), patch.object(
-            main,
-            "_collect_relation_from_actor",
+            "_collect_official_actor",
             return_value=exposed,
         ), patch.object(
             main,
-            "APIFY_RELATION_ATTEMPTS",
-            1,
+            "_collect_session_actor",
+            return_value=[],
         ):
             with self.assertRaises(HTTPException) as error:
                 main._collect_relation(
@@ -360,7 +386,7 @@ class ApiTests(unittest.TestCase):
                 patch.object(main, "_collect_relation", side_effect=relation):
             payload = main._collect_profile("example")
 
-        self.assertEqual(relation_calls, ["Followers", "Followings"])
+        self.assertEqual(relation_calls, ["Followings", "Followers"])
         self.assertTrue(payload["complete"])
 
     def test_counts_are_rechecked_after_lists(self):
