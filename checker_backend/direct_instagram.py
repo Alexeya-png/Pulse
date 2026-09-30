@@ -528,10 +528,21 @@ def _collect_pages(
     # hosts and pagination parameters can expose different slices. Merge all
     # observed rows by immutable numeric ID and only accept the exact count.
     found: dict[str, dict] = {}
-    transport_sessions = _relationship_sessions(session)
+    cookie_map = requests.utils.dict_from_cookiejar(session.cookies)
+    has_authenticated_session = bool(cookie_map.get("sessionid"))
+    transport_sessions = (
+        _relationship_sessions(session)
+        if has_authenticated_session
+        else [("primary-browser", session, False)]
+    )
+    relation_variants = (
+        RELATION_VARIANTS
+        if has_authenticated_session
+        else RELATION_VARIANTS[:1]
+    )
     try:
         for transport_name, candidate, _close_candidate in transport_sessions:
-            for variant_name, variant_params in RELATION_VARIANTS:
+            for variant_name, variant_params in relation_variants:
                 for base in RELATION_BASES:
                     max_id = None
                     seen_cursors: set[str] = set()
