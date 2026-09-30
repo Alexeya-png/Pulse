@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .model import DataError, Snapshot, username
+from .model import DataError, Member, Snapshot, username
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS streams (
@@ -124,6 +124,25 @@ class Store:
                 counts["added"] += added
                 counts["removed"] += removed
         return ImportResult(**counts)
+
+    def current_members(self, account: str, kind: str) -> tuple[Member, ...]:
+        if kind not in {"followers", "following"}:
+            raise DataError("Неизвестный тип списка.")
+        account = username(account)
+        with self.connect() as db:
+            stream = db.execute(
+                "SELECT id,identity FROM streams WHERE account=? AND kind=? AND subject=''",
+                (account, kind),
+            ).fetchone()
+            if not stream:
+                return ()
+            rows = db.execute(
+                "SELECT member_key,username FROM members WHERE stream_id=? ORDER BY member_key",
+                (stream["id"],),
+            )
+            if stream["identity"] == "id":
+                return tuple(Member(row["username"], row["member_key"]) for row in rows)
+            return tuple(Member(row["username"]) for row in rows)
 
     def accounts(self) -> list[str]:
         with self.connect() as db:
