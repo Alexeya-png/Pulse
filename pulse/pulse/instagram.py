@@ -79,18 +79,26 @@ class InstagramReader:
             raise SyncError("Instagram вернул неполный список. Изменения не вычислялись.", "incomplete")
         return tuple(found.values())
 
-    def collect(self, target: str, *, recent_posts: int = 0) -> Collection:
-        target = username(target)
+    def profile(self, target: str) -> dict:
         profile = self.request(f"users/{target}/usernameinfo/").get("user")
         if not isinstance(profile, dict) or not str(profile.get("pk", "")).isdigit():
-            raise SyncError("Профиль недоступен подключённому аккаунту.", "unavailable")
+            raise SyncError("Профиль недоступен checker-аккаунту.", "unavailable")
+        if type(profile.get("follower_count")) is not int or type(profile.get("following_count")) is not int:
+            info = self.request(f"users/{profile['pk']}/info/").get("user")
+            if isinstance(info, dict) and str(info.get("pk", info.get("id", ""))) == str(profile["pk"]):
+                profile = {**profile, **info}
+        return profile
+
+    def collect(self, target: str, *, recent_posts: int = 0) -> Collection:
+        target = username(target)
+        profile = self.profile(target)
         target_id = str(profile["pk"])
         expected = self.count(profile, "follower_count")
         following_count = self.count(profile, "following_count")
         try:
             followers = self.users(f"friendships/{target_id}/followers/", expected, "Подписчики")
             following = self.users(f"friendships/{target_id}/following/", following_count, "Подписки")
-            after = self.request(f"users/{target}/usernameinfo/").get("user", {})
+            after = self.profile(target)
             if self.count(after, "follower_count") != expected or self.count(after, "following_count") != following_count or str(after.get("pk")) != target_id:
                 raise SyncError("Подписчики или подписки изменились во время загрузки.", "incomplete")
         except SyncError as exc:

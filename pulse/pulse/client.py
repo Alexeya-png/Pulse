@@ -20,6 +20,7 @@ ORIGIN = "https://www.instagram.com"
 COOKIE_NAMES = {"sessionid", "csrftoken", "ds_user_id", "mid", "ig_did", "rur"}
 MAX_BODY = 8 * 1024 * 1024
 WEB_APP_ID = "936619743392459"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Mobile Safari/537.36"
 # A strict endpoint allowlist prevents credentials being sent to arbitrary URLs.
 ENDPOINT = re.compile(r"(?:users/[a-z0-9_.]{1,30}/usernameinfo/|users/[0-9]{1,40}/info/|accounts/current_user/|friendships/[0-9]{1,40}/(?:followers|following)/)\Z")
 
@@ -37,13 +38,16 @@ def parse_login_cookies(header: str) -> dict[str, str]:
     return cookies
 
 
-def validate_cookies(cookies):
-    if not isinstance(cookies, dict) or not {"sessionid", "csrftoken", "ds_user_id"} <= cookies.keys():
+def validate_cookies(cookies, *, require_owner=True):
+    if not isinstance(cookies, dict) or not cookies.get("sessionid"):
+        raise SyncError("Вход в Instagram ещё не завершён.", "auth")
+    if require_owner and not {"csrftoken", "ds_user_id"} <= cookies.keys():
         raise SyncError("Вход в Instagram ещё не завершён.", "auth")
     for key, value in cookies.items():
         if key not in COOKIE_NAMES or not isinstance(value, str) or not value or len(value) > 8192 or any(ord(c) < 32 or ord(c) > 126 for c in value):
             raise SyncError("Некорректные данные сессии.", "auth")
-    if not re.fullmatch(r"[0-9]{1,40}", cookies["ds_user_id"]):
+    owner = cookies.get("ds_user_id")
+    if owner is not None and not re.fullmatch(r"[0-9]{1,40}", owner):
         raise SyncError("Не удалось определить аккаунт сессии.", "auth")
 
 
@@ -59,39 +63,44 @@ class InstagramClient:
         self.user_id = None
 
     def set_settings(self, settings):
-        if not isinstance(settings, dict) or settings.get("version") != 2:
-            raise SyncError("Формат подключения обновлён. Войдите в Instagram заново; история сохранена.", "auth")
+        if not isinstance(settings, dict) or settings.get("version") not in (2, 3):
+            raise SyncError("Формат подключения обновлён. Добавьте checker-сессию заново; история сохранена.", "auth")
         cookies = settings.get("cookies")
-        validate_cookies(cookies)
-        agent = settings.get("user_agent", "")
+        validate_cookies(cookies, require_owner=settings.get("version") == 2)
+        agent = settings.get("user_agent") or DEFAULT_USER_AGENT
         if not isinstance(agent, str) or not agent or len(agent) > 1024 or any(ord(c) < 32 or ord(c) > 126 for c in agent):
             raise SyncError("Некорректные данные браузерной сессии.", "auth")
         self.http.cookies.clear()
         for key, value in cookies.items():
             self.http.cookies.set(key, value, domain=".instagram.com", path="/", secure=True)
-        self.http.headers.update({"User-Agent": agent, "X-CSRFToken": cookies["csrftoken"]})
-        self.user_id = cookies["ds_user_id"]
+        self.http.headers.update({"User-Agent": agent})
+        if cookies.get("csrftoken"):
+            self.http.headers.update({"X-CSRFToken": cookies["csrftoken"]})
+        else:
+            self.http.headers.pop("X-CSRFToken", None)
+        self.user_id = cookies.get("ds_user_id")
         self.account = username(settings["account"]) if settings.get("account") else None
 
     def get_settings(self):
-        # Only retain Instagram cookies; the client never follows cross-site redirects.
         cookies = {c.name: c.value for c in self.http.cookies if c.name in COOKIE_NAMES and c.domain.lstrip(".") in {"instagram.com", "www.instagram.com"}}
-        validate_cookies(cookies)
-        return {"version": 2, "cookies": cookies, "user_agent": self.http.headers["User-Agent"], "account": self.account}
+        validate_cookies(cookies, require_owner=False)
+        return {"version": 3, "cookies": cookies, "user_agent": self.http.headers.get("User-Agent") or DEFAULT_USER_AGENT, "account": self.account}
 
     def verify_session(self):
         result = self.request("accounts/current_user/", {"edit": "true"})
         user = result.get("user")
-        if not isinstance(user, dict) or str(user.get("pk", user.get("id", ""))) != self.user_id:
+        current_id = str(user.get("pk", user.get("id", ""))) if isinstance(user, dict) else ""
+        if not current_id or (self.user_id and current_id != self.user_id):
             raise SyncError("Instagram не подтвердил аккаунт сессии.", "auth")
+        self.user_id = current_id
         self.account = username(user.get("username"))
         return self.account
 
     def request(self, endpoint: str, params=None):
         if not ENDPOINT.fullmatch(endpoint):
             raise SyncError("Запрос к этому адресу не разрешён.", "data")
-        if not self.user_id:
-            raise SyncError("Подключите аккаунт Instagram.", "auth")
+        if not any(cookie.name == "sessionid" and cookie.value for cookie in self.http.cookies):
+            raise SyncError("Добавьте checker-сессию Instagram.", "auth")
         if self.cancel.wait(max(0, self.delay - (time.monotonic() - self.last_request))):
             raise SyncError("Проверка отменена.", "cancelled")
         self.last_request = time.monotonic()

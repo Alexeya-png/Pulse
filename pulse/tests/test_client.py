@@ -61,6 +61,14 @@ class ClientTests(unittest.TestCase):
                     self.client.request("users/owner/usernameinfo/")
                 self.assertEqual(exc.exception.code, "data")
 
+    def test_version3_accepts_sessionid_only(self):
+        client = InstagramClient(delay=0)
+        try:
+            client.set_settings({"version": 3, "cookies": {"sessionid": "fixture"}, "user_agent": "fixture-agent"})
+            self.assertEqual(client.get_settings()["cookies"]["sessionid"], "fixture")
+        finally:
+            client.close()
+
     def test_bad_cookies_and_legacy_sessions_rejected(self):
         for value in ("sessionid=x", "sessionid=x; csrftoken=x; ds_user_id=nope", "sessionid=x\r\nInjected: yes"):
             with self.assertRaises(SyncError):
