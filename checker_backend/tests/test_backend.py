@@ -392,6 +392,44 @@ class ApiTests(unittest.TestCase):
             {"1", "2", "3"},
         )
 
+    def test_following_final_fallback_can_fill_one_missing_member(self):
+        exposed = [
+            {"id": str(i), "username": f"user{i}"}
+            for i in range(1, 110)
+        ]
+        missing = [{"id": "110", "username": "user110"}]
+        with patch.object(
+            main,
+            "_collect_full_following_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_free_following_actor",
+            return_value=exposed,
+        ), patch.object(
+            main,
+            "_collect_official_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_session_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_relation_from_actor",
+            return_value=missing,
+        ) as fallback:
+            result = main._collect_relation(
+                "example",
+                110,
+                "Followings",
+                "Подписки",
+            )
+
+        self.assertEqual(len(result), 110)
+        self.assertEqual({item["id"] for item in result}, {str(i) for i in range(1, 111)})
+        fallback.assert_called_once()
+
     def test_relation_rejects_one_hidden_record_for_large_list(self):
         exposed = [
             {"id": str(i), "username": f"user{i}"}
@@ -413,6 +451,10 @@ class ApiTests(unittest.TestCase):
             main,
             "_collect_session_actor",
             return_value=[],
+        ), patch.object(
+            main,
+            "_collect_relation_from_actor",
+            return_value=exposed,
         ):
             with self.assertRaises(HTTPException) as error:
                 main._collect_relation(
@@ -444,6 +486,10 @@ class ApiTests(unittest.TestCase):
             main,
             "_collect_session_actor",
             return_value=[],
+        ), patch.object(
+            main,
+            "_collect_relation_from_actor",
+            return_value=exposed,
         ):
             with self.assertRaises(HTTPException) as error:
                 main._collect_relation(

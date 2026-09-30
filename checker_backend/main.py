@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from urllib3.util import Timeout
 
-app = FastAPI(title="Pulse Checker", version="0.5.6")
+app = FastAPI(title="Pulse Checker", version="0.5.7")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -897,9 +897,11 @@ def _collect_relation(
                 _pause(APIFY_RETRY_DELAY)
 
     if is_following:
-        raise HTTPException(
-            409,
-            f"{label}: получено {len(combined)} из {expected}. Снимок не сохранён.",
+        logger.info(
+            "Following still incomplete at %d/%d for %s; trying general relation fallbacks",
+            len(combined),
+            expected,
+            label,
         )
 
     providers = [
