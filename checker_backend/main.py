@@ -40,7 +40,7 @@ def _api_key() -> str:
     return key
 
 
-def _get(path: str, params: dict) -> dict:
+def _get(path: str, params: dict):
     try:
         response = requests.get(
             HIKER_BASE_URL + path,
@@ -87,13 +87,13 @@ def _get(path: str, params: dict) -> dict:
     except ValueError:
         raise HTTPException(502, "Сервис Instagram-данных вернул повреждённый ответ.") from None
 
-    if not isinstance(data, dict):
-        raise HTTPException(502, "Сервис Instagram-данных вернул неожиданный ответ.")
     return data
 
 
 def _profile(username: str) -> dict:
     data = _get("/v1/user/by/username", {"username": username})
+    if not isinstance(data, dict):
+        raise HTTPException(502, "HikerAPI вернул неожиданный ответ профиля.")
     if not data.get("pk"):
         raise HTTPException(404, "Instagram-аккаунт не найден.")
     return data
@@ -123,7 +123,19 @@ def _collect_pages(path: str, user_id: str, expected: int, label: str) -> list[d
             params["max_id"] = max_id
 
         page = _get(path, params)
-        users = page.get("users")
+
+        # HikerAPI v1 chunk endpoints currently return either:
+        #   [users, next_max_id]
+        # or, on some deployments, {"users": [...], "next_max_id": "..."}.
+        if isinstance(page, list) and len(page) >= 1:
+            users = page[0]
+            next_max_id = page[1] if len(page) > 1 else None
+        elif isinstance(page, dict):
+            users = page.get("users")
+            next_max_id = page.get("next_max_id")
+        else:
+            raise HTTPException(502, f"{label}: HikerAPI вернул неожиданный формат страницы.")
+
         if not isinstance(users, list):
             raise HTTPException(502, f"{label}: сервис вернул неполную страницу.")
 
@@ -133,7 +145,6 @@ def _collect_pages(path: str, user_id: str, expected: int, label: str) -> list[d
             if len(result) > MAX_MEMBERS:
                 raise HTTPException(413, f"{label}: список больше лимита сервера.")
 
-        next_max_id = page.get("next_max_id")
         if not next_max_id:
             break
 
