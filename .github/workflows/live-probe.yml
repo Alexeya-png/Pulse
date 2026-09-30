@@ -1,0 +1,42 @@
+name: One-shot kh.alexeya verification
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/live-probe.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 6
+    steps:
+      - name: Call live collector
+        run: |
+          python - <<'PY'
+          import json
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+
+          req = Request(
+              "https://pulse-checker-702b.onrender.com/v1/collect",
+              data=json.dumps({"username": "kh.alexeya"}).encode(),
+              headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "Pulse-live-verification/1.0"},
+              method="POST",
+          )
+          try:
+              with urlopen(req, timeout=240) as r:
+                  payload = json.loads(r.read().decode())
+                  print("HTTP_STATUS", r.status)
+                  print("ACCOUNT", payload.get("account"))
+                  print("FOLLOWERS", len(payload.get("followers") or []), "/", payload.get("followers_count"))
+                  print("FOLLOWING", len(payload.get("following") or []), "/", payload.get("following_count"))
+                  print("COMPLETE", payload.get("complete"))
+                  print("SOURCE", payload.get("source"))
+          except HTTPError as e:
+              body = e.read().decode("utf-8", "replace")
+              print("HTTP_STATUS", e.code)
+              print("ERROR_BODY", body)
+          PY
