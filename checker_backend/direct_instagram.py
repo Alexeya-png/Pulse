@@ -229,12 +229,7 @@ def _json_get(
             best_status, best_data = alt_status, alt_data
 
     if best_status == 429:
-        logger.warning("Direct Instagram fallback remained rate-limited on all transports")
-        raise HTTPException(
-            503,
-            "Instagram ограничил прямые запросы с сервера. Снимок не сохранён.",
-        )
-
+        logger.warning("Direct Instagram endpoint rate-limited on all transports")
     return best_status, best_data
 
 def _as_int(value) -> int | None:
@@ -325,14 +320,87 @@ def _search_profile(session: requests.Session, target: str, deadline: float) -> 
     return None
 
 
+def _parse_exact_count(value: str) -> int | None:
+    compact = value.replace(",", "").replace(" ", "").strip()
+    if not compact.isdigit():
+        return None
+    return int(compact)
+
+
+def _profile_page_counts(
+    session: requests.Session,
+    target: str,
+    deadline: float,
+) -> tuple[int | None, int | None]:
+    url = f"https://www.instagram.com/{target}/"
+    sessions: list[tuple[str, requests.Session]] = [("primary", session)]
+    sessions.extend(_fallback_sessions(session))
+    try:
+        for name, candidate in sessions:
+            _pace(deadline)
+            remaining = _remaining(deadline)
+            try:
+                response = candidate.get(
+                    url,
+                    timeout=(min(8.0, remaining), min(30.0, remaining)),
+                    allow_redirects=True,
+                )
+            except requests.RequestException:
+                continue
+            if response.status_code != 200:
+                continue
+
+            text = response.text
+            patterns = (
+                (
+                    r'"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+                    r'"edge_follow"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+                ),
+                (
+                    r'"follower_count"\s*:\s*(\d+)',
+                    r'"following_count"\s*:\s*(\d+)',
+                ),
+                (
+                    r'([\d, ]+)\s+Followers\s*,\s*([\d, ]+)\s+Following',
+                    None,
+                ),
+            )
+            for followers_pattern, following_pattern in patterns:
+                first = re.search(followers_pattern, text, re.IGNORECASE)
+                if not first:
+                    continue
+                if following_pattern is None:
+                    followers = _parse_exact_count(first.group(1))
+                    following = _parse_exact_count(first.group(2))
+                else:
+                    second = re.search(following_pattern, text, re.IGNORECASE)
+                    if not second:
+                        continue
+                    followers = _parse_exact_count(first.group(1))
+                    following = _parse_exact_count(second.group(1))
+                if followers is not None and following is not None:
+                    logger.info("Direct exact profile counts recovered from profile page via %s", name)
+                    return followers, following
+    finally:
+        for name, candidate in sessions:
+            if name != "primary":
+                candidate.close()
+    return None, None
+
+
 def _profile(session: requests.Session, target: str, deadline: float) -> dict:
     best = None
     saw_forbidden = False
     saw_not_found = False
+    saw_rate_limit = False
+
     for url in PROFILE_URLS:
         status, data = _json_get(session, url, {"username": target}, deadline)
         if status == 404:
             saw_not_found = True
+            continue
+        if status == 429:
+            saw_rate_limit = True
             continue
         if status in (401, 403):
             saw_forbidden = True
@@ -346,16 +414,21 @@ def _profile(session: requests.Session, target: str, deadline: float) -> dict:
         if profile["followers_count"] is not None and profile["following_count"] is not None:
             return profile
 
-    if best:
+    # Search can still work when web_profile_info is cloud-rate-limited.
+    search = _search_profile(session, target, deadline)
+    if search:
+        if not best:
+            best = search
         info = _user_info(session, best["id"], target, deadline)
         if info:
             best = info
-    if not best:
-        best = _search_profile(session, target, deadline)
-        if best:
-            info = _user_info(session, best["id"], target, deadline)
-            if info:
-                best = info
+
+    # The public profile HTML often exposes exact small-account counts in
+    # embedded JSON or OG metadata even when API endpoints return 429.
+    followers_count, following_count = _profile_page_counts(session, target, deadline)
+    if best and followers_count is not None and following_count is not None:
+        best["followers_count"] = followers_count
+        best["following_count"] = following_count
 
     if best and best["followers_count"] is not None and best["following_count"] is not None:
         return best
@@ -363,10 +436,11 @@ def _profile(session: requests.Session, target: str, deadline: float) -> dict:
         raise HTTPException(503, "Instagram не вернул точные счётчики профиля.")
     if saw_forbidden:
         raise HTTPException(503, "Instagram не принял checker-сессию с Render.")
-    if saw_not_found:
+    if saw_not_found and not saw_rate_limit:
         raise HTTPException(404, "Instagram-аккаунт не найден.")
+    if saw_rate_limit:
+        raise HTTPException(503, "Instagram ограничил профильные endpoints с сервера.")
     raise HTTPException(503, "Instagram не дал получить профиль прямому collector.")
-
 
 def _member(row: dict) -> dict:
     user_id = row.get("pk") or row.get("id") or row.get("pk_id")
