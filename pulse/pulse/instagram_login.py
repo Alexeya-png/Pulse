@@ -52,6 +52,7 @@ def open_instagram_login(
         LinearLayout = autoclass("android.widget.LinearLayout")
         Button = autoclass("android.widget.Button")
         WebView = autoclass("android.webkit.WebView")
+        WebViewClient = autoclass("android.webkit.WebViewClient")
         CookieManager = autoclass("android.webkit.CookieManager")
         ViewGroupParams = autoclass("android.view.ViewGroup$LayoutParams")
         Toast = autoclass("android.widget.Toast")
@@ -75,6 +76,7 @@ def open_instagram_login(
         settings.setJavaScriptEnabled(True)
         settings.setDomStorageEnabled(True)
         settings.setDatabaseEnabled(True)
+        web.setWebViewClient(WebViewClient())
 
         cookies = CookieManager.getInstance()
         cookies.setAcceptCookie(True)
