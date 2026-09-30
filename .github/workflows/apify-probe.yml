@@ -1,0 +1,32 @@
+name: Temporary Apify actor probe
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/apify-probe.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Inspect public actor metadata
+        run: |
+          python - <<'PY'
+          import json
+          from urllib.request import urlopen
+
+          base = "https://api.apify.com/v2/acts/scraping_solutions~instagram-scraper-followers-following-no-cookies"
+          for suffix in ["", "/versions", "/versions/0.0"]:
+              url = base + suffix
+              print("\nURL", url)
+              try:
+                  with urlopen(url, timeout=30) as r:
+                      data = json.load(r)
+                  print(json.dumps(data, ensure_ascii=False)[:30000])
+              except Exception as e:
+                  print(type(e).__name__, str(e))
+          PY
