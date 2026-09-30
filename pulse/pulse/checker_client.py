@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+import certifi
 
 from .checker_config import BACKEND_BASE_URL
 from .model import DataError, Member, Sample, Snapshot, username
@@ -22,6 +27,30 @@ def configured() -> bool:
     )
 
 
+def _ssl_context():
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def _request(request: Request, timeout: int):
+    last_error = None
+    for attempt in range(3):
+        try:
+            return urlopen(request, timeout=timeout, context=_ssl_context())
+        except HTTPError:
+            raise
+        except (URLError, TimeoutError, OSError, ssl.SSLError, socket.timeout) as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    reason = getattr(last_error, "reason", last_error)
+    text = str(reason or "").lower()
+    if "certificate" in text or "ssl" in text:
+        raise CheckerError("Ошибка защищённого соединения с сервером. Обновите Pulse.") from None
+    if "timed out" in text or "timeout" in text:
+        raise CheckerError("Сервер проверки долго отвечает. Попробуйте ещё раз через минуту.") from None
+    raise CheckerError("Не удалось связаться с сервером проверки.") from None
+
+
 def collect_snapshot(account: str) -> Snapshot:
     account = username(account)
     if not configured():
@@ -34,13 +63,14 @@ def collect_snapshot(account: str) -> Snapshot:
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "Pulse-Android/0.5",
+            "User-Agent": "Pulse-Android/0.5.1",
         },
         method="POST",
     )
 
     try:
-        with urlopen(request, timeout=180) as response:
+        response = _request(request, 210)
+        with response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except HTTPError as exc:
         try:
@@ -48,9 +78,7 @@ def collect_snapshot(account: str) -> Snapshot:
             message = payload.get("detail")
         except Exception:
             message = None
-        raise CheckerError(message or "Instagram не завершил проверку.") from None
-    except (URLError, TimeoutError, OSError):
-        raise CheckerError("Не удалось связаться с сервером проверки.") from None
+        raise CheckerError(message or f"Сервер вернул ошибку {exc.code}.") from None
 
     if len(raw) > MAX_RESPONSE_BYTES:
         raise CheckerError("Ответ слишком большой для обработки на устройстве.")
