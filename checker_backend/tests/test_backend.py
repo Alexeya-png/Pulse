@@ -25,6 +25,36 @@ class ApiTests(unittest.TestCase):
             "hiker_dependency": False,
         })
 
+    def test_apify_failure_uses_direct_instagram_fallback(self):
+        snapshot = {
+            "account": "example",
+            "captured_at": "2026-09-30T00:00:00+00:00",
+            "followers_count": 1,
+            "following_count": 1,
+            "followers": [{"id": "1", "username": "alice"}],
+            "following": [{"id": "1", "username": "alice"}],
+            "complete": True,
+            "source": "pulse-direct-fallback",
+        }
+        with patch.object(
+            main,
+            "_collect_profile_apify",
+            side_effect=HTTPException(503, "Apify unavailable"),
+        ), patch.object(
+            main,
+            "_checker_sessionid",
+            return_value="configured",
+        ), patch.object(
+            main,
+            "collect_direct_snapshot",
+            return_value=snapshot,
+        ) as direct:
+            response = self.client.post("/v1/collect", json={"username": "example"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["complete"])
+        self.assertEqual(response.json()["source"], "pulse-direct-fallback")
+        direct.assert_called_once()
+
     def test_input_validation(self):
         with patch.object(main, "_collect_profile") as collect:
             self.assertEqual(

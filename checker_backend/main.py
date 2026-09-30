@@ -13,7 +13,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from urllib3.util import Timeout
 
-app = FastAPI(title="Pulse Checker", version="0.6.1")
+from checker_backend.direct_instagram import collect_direct_snapshot
+
+app = FastAPI(title="Pulse Checker", version="0.6.2")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -1199,7 +1201,7 @@ def _collect_relation(
     )
 
 
-def _collect_profile(target: str) -> dict:
+def _collect_profile_apify(target: str) -> dict:
     before = _profile(target)
     if before["is_private"]:
         raise HTTPException(
@@ -1268,6 +1270,20 @@ def _collect_profile(target: str) -> dict:
         "complete": True,
         "source": "apify-online",
     }
+
+
+def _collect_profile(target: str) -> dict:
+    try:
+        return _collect_profile_apify(target)
+    except HTTPException as exc:
+        if exc.status_code not in (409, 429, 502, 503) or not _checker_sessionid():
+            raise
+        logger.warning(
+            "Apify collector unavailable (%d); trying direct Instagram fallback",
+            exc.status_code,
+        )
+        deadline = time.monotonic() + _remaining()
+        return collect_direct_snapshot(target, deadline)
 
 
 @app.get("/health")
