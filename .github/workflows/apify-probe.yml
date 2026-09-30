@@ -13,37 +13,32 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
-      - name: Search Apify Store alternatives
+      - name: Inspect candidate actor schemas
         run: |
           python - <<'PY'
           import json
-          from urllib.parse import urlencode
           from urllib.request import urlopen
 
-          for query in [
-              "instagram followers following",
-              "instagram followers scraper",
-              "instagram following scraper",
-          ]:
-              url = "https://api.apify.com/v2/store?" + urlencode({
-                  "search": query,
-                  "limit": 30,
-                  "offset": 0,
-              })
-              with urlopen(url, timeout=30) as r:
-                  data = json.load(r)
-              print("\nQUERY", query)
-              items = data.get("data", {}).get("items", [])
-              for item in items:
-                  out = {
-                      "id": item.get("id"),
-                      "username": item.get("username"),
-                      "name": item.get("name"),
-                      "title": item.get("title"),
-                      "description": item.get("description"),
-                      "stats": item.get("stats"),
-                      "pricingInfos": item.get("pricingInfos"),
-                      "currentPricingInfo": item.get("currentPricingInfo"),
-                  }
-                  print(json.dumps(out, ensure_ascii=False))
+          actors = [
+              "apify~instagram-followers-following-scraper",
+              "coderx~instagram-followers-following-scraper-no-cookies-login",
+              "dami_studio~instagram-followers-following-scraper",
+          ]
+          for actor in actors:
+              print("\n=== ACTOR", actor, "===")
+              with urlopen(f"https://api.apify.com/v2/acts/{actor}", timeout=30) as r:
+                  meta = json.load(r)["data"]
+              latest = meta.get("taggedBuilds", {}).get("latest", {})
+              print("META", json.dumps({
+                  "id": meta.get("id"),
+                  "latest": latest,
+                  "currentPricingInfo": meta.get("currentPricingInfo"),
+              }, ensure_ascii=False))
+              build_id = latest.get("buildId")
+              if build_id:
+                  with urlopen(f"https://api.apify.com/v2/actor-builds/{build_id}", timeout=30) as r:
+                      build = json.load(r)["data"]
+                  print("INPUT_SCHEMA", build.get("inputSchema"))
+                  print("DATASET_SCHEMA", build.get("datasetSchema"))
+                  print("README", (build.get("readme") or "")[:25000])
           PY
