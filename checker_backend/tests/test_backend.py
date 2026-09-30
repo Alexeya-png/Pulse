@@ -104,7 +104,15 @@ class ApiTests(unittest.TestCase):
                 patch.object(main, "_wait_run", side_effect=runs), \
                 patch.object(main, "_dataset_items", side_effect=datasets), \
                 patch.object(main, "_run_output", side_effect=outputs):
-            result = main._collect_relation("example", 3, "Followers", "Подписчики")
+            result = main._collect_relation_from_actor(
+                "actor",
+                25,
+                {},
+                "example",
+                3,
+                "Followers",
+                "Подписчики",
+            )
         self.assertEqual(result, [
             {"id": "1", "username": "alice"},
             {"id": "2", "username": "bob"},
@@ -119,9 +127,64 @@ class ApiTests(unittest.TestCase):
                     {"id": "1", "username": "alice", "username_scrape": "example", "type": "Followers"},
                 ]), \
                 patch.object(main, "_run_output", return_value={}):
-            with self.assertRaises(HTTPException) as error:
-                main._collect_relation("example", 2, "Followers", "Подписчики")
-        self.assertEqual(error.exception.status_code, 409)
+            result = main._collect_relation_from_actor(
+                "actor",
+                25,
+                {},
+                "example",
+                2,
+                "Followers",
+                "Подписчики",
+            )
+        self.assertEqual(result, [{"id": "1", "username": "alice"}])
+
+    def test_relation_wrapper_uses_followings_and_fallback(self):
+        calls = []
+
+        def collect(actor, min_limit, extra_input, username, expected, data_type, label):
+            calls.append((actor, min_limit, extra_input, data_type))
+            if len(calls) == 1:
+                return []
+            return [
+                {"id": "1", "username": "alice"},
+                {"id": "2", "username": "bob"},
+            ]
+
+        with patch.object(main, "_collect_relation_from_actor", side_effect=collect):
+            result = main._collect_relation(
+                "example",
+                2,
+                "Followings",
+                "Подписки",
+            )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(calls[0][3], "Followings")
+        self.assertEqual(calls[1][3], "Followings")
+        self.assertEqual(calls[0][1], 50)
+        self.assertEqual(calls[1][1], 25)
+
+    def test_collect_profile_requests_followings_plural(self):
+        profile = {
+            "id": "123",
+            "username": "example",
+            "followers_count": 1,
+            "following_count": 1,
+            "is_private": False,
+        }
+        users = [{"id": "1", "username": "alice"}]
+        relation_calls = []
+
+        def relation(username, expected, data_type, label):
+            relation_calls.append(data_type)
+            return users
+
+        with patch.object(main, "_profile", side_effect=[profile, profile]), \
+                patch.object(main, "_collect_relation", side_effect=relation):
+            payload = main._collect_profile("example")
+
+        self.assertEqual(relation_calls, ["Followers", "Followings"])
+        self.assertTrue(payload["complete"])
 
     def test_counts_are_rechecked_after_lists(self):
         before = {
