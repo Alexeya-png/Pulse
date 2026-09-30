@@ -27,8 +27,7 @@ from kivy.utils import platform
 
 from .model import DataError, Member, Sample, Snapshot, username
 from .store import Store
-from .checker_client import collect_snapshot, session_settings_from_json
-from .vault import SessionVault
+from .checker_client import collect_snapshot
 
 BG = (0.047, 0.055, 0.078, 1)
 CARD = (0.09, 0.102, 0.137, 1)
@@ -172,8 +171,6 @@ class PulseApp(App):
             self.save_prefs()
         self.real_store = Store(self.data_dir / "pulse.sqlite3")
         self.store = self.real_store
-        self.session_vault = SessionVault(self.data_dir / "checker-session.vault", platform == "android")
-        self.session_settings = None
         if self.demo_mode:
             self.seed_demo()
         root = BoxLayout(orientation="vertical", padding=[dp(20), dp(16)], spacing=dp(9))
@@ -302,14 +299,6 @@ class PulseApp(App):
         future.add_done_callback(lambda _: Clock.schedule_once(complete))
 
     def restore_session(self):
-        try:
-            self.session_settings = self.session_vault.load()
-        except DataError as exc:
-            self.session_settings = None
-            self.message(str(exc))
-        if self.session_settings:
-            self.mode_label.text = "INSTAGRAM · PHONE"
-            self.message("Checker-сессия сохранена на телефоне. Можно собирать данные напрямую.")
         self._update_collection_button()
 
     def sync(self):
@@ -320,9 +309,6 @@ class PulseApp(App):
 
     def _update_collection_button(self):
         if not hasattr(self, "sync_btn"):
-            return
-        if not self.session_settings and not self.demo_mode:
-            self.sync_btn.text = "Подключить checker"
             return
         try:
             account = username(self.target.text)
@@ -345,21 +331,10 @@ class PulseApp(App):
             self.target.focus = True
             return
 
-        if not self.session_settings:
-            self.message("Сначала добавьте Checker session JSON в настройках.")
-            self.settings_dialog()
-            return
-
-        self.cancel.clear()
-        self.message("Телефон напрямую собирает подписчиков и подписки из Instagram…")
+        self.message("Собираем полный список подписчиков и подписок…")
 
         def work():
-            snapshot = collect_snapshot(
-                account,
-                self.session_settings,
-                cancel=self.cancel,
-                progress=self.progress,
-            )
+            snapshot = collect_snapshot(account)
             changes = self.store.ingest(snapshot)
             return changes
 
@@ -476,64 +451,8 @@ class PulseApp(App):
         self.collection_action()
 
     def settings_dialog(self):
-        status = label(
-            "Сессия сохранена на этом телефоне." if self.session_settings else "Checker-сессия ещё не добавлена.",
-            size=11,
-            color=LIME if self.session_settings else MUTED,
-            height=34,
-        )
-        note = label(
-            "Вставьте тот же JSON с sessionid, который использовался для checker. Он шифруется Android Keystore и не отправляется на Render.",
-            size=11,
-            color=MUTED,
-            height=58,
-        )
-        session_input = TextInput(
-            hint_text='{"sessionid":"...","csrftoken":"..."}',
-            multiline=True,
-            password=True,
-            size_hint_y=None,
-            height=dp(105),
-            background_normal="",
-            background_active="",
-            background_color=CARD,
-            foreground_color=INK,
-            hint_text_color=MUTED,
-            cursor_color=LIME,
-            padding=[dp(12), dp(10)],
-            font_size=dp(12),
-        )
-        save = Pill(text="Сохранить checker-сессию", fill=LIME, color=BG, size_hint_y=None, height=dp(43))
-        remove = Pill(text="Удалить checker-сессию", size_hint_y=None, height=dp(43))
         demo = Pill(text="Выйти из демо" if self.demo_mode else "Посмотреть демо", size_hint_y=None, height=dp(43))
-        popup = self.modal("Настройки", [status, note, session_input, save, remove, demo], height=430)
-
-        def save_session(_):
-            try:
-                settings = session_settings_from_json(session_input.text)
-                self.session_vault.save(settings)
-            except DataError as exc:
-                status.text = str(exc)
-                status.color = PINK
-                return
-            self.session_settings = settings
-            session_input.text = ""
-            status.text = "Checker-сессия сохранена и зашифрована на телефоне."
-            status.color = LIME
-            self.mode_label.text = "INSTAGRAM · PHONE"
-            self._update_collection_button()
-
-        def remove_session(_):
-            try:
-                self.session_vault.clear()
-            except Exception:
-                pass
-            self.session_settings = None
-            session_input.text = ""
-            status.text = "Checker-сессия удалена с телефона."
-            status.color = MUTED
-            self.mode_label.text = "INSTAGRAM"
-            self._update_collection_button()
+        popup = self.modal("Настройки", [demo], height=170)
 
         def show_demo(_):
             self.demo_mode = not self.demo_mode
@@ -541,22 +460,19 @@ class PulseApp(App):
                 self.seed_demo()
             else:
                 self.store = self.real_store
-            self.mode_label.text = "ДЕМО" if self.demo_mode else ("INSTAGRAM · PHONE" if self.session_settings else "INSTAGRAM")
+            self.mode_label.text = "ДЕМО" if self.demo_mode else "INSTAGRAM"
             self.target.text = "demo_account" if self.demo_mode else self.prefs.get("target", "")
             self.cursor, self.page_stack = None, []
             popup.dismiss()
             self.refresh()
 
-        save.bind(on_release=save_session)
-        remove.bind(on_release=remove_session)
         demo.bind(on_release=show_demo)
 
     def help_dialog(self):
         self.dialog(
             "Как работает Pulse",
-            "В настройках один раз добавьте Checker session JSON. Pulse хранит его зашифрованно через Android Keystore.\n\n"
-            "После этого приложение обращается к Instagram напрямую с IP телефона — Render и HikerAPI в сборе не участвуют. Введите Instagram-ник и нажмите «Собрать данные». Первый полный сбор станет точкой отсчёта, следующие покажут отписки, новых и невзаимные подписки.\n\n"
-            "Если профиль приватный, checker-аккаунт должен быть на него подписан. Неполный список никогда не сохраняется как полноценный снимок."
+            "Введите Instagram-ник и нажмите «Собрать данные». Онлайн-сервис получает полный список followers и following и возвращает в Pulse только готовый проверенный снимок. Первый полный сбор сохраняется как точка отсчёта. Следующие сборы сравниваются с предыдущим и показывают отписки, новых подписчиков и невзаимные подписки.\n\n"
+            "Онлайн-режим работает с публичными профилями. Если сервис возвращает неполный список или данные меняются во время проверки, Pulse не сохраняет такой снимок."
         )
 
     def on_pause(self):

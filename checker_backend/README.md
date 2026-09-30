@@ -1,84 +1,60 @@
 # Pulse checker backend
 
-The backend uses one dedicated Instagram checker account to read followers and
-following lists that account is allowed to see. Pulse stores snapshots locally
-on Android and compares only complete snapshots.
+Pulse keeps the same online architecture as the previously working HikerAPI version:
 
-## Environment
+Android APK -> Render pulse-checker -> online Instagram data provider -> validated snapshot.
 
-Required:
+The APK sends only the target username. It contains no Instagram session, provider token,
+password, cookie, Hiker key, or Apify token.
 
-- IG_SESSION_JSON: JSON containing the checker account sessionid and any other
-  Instagram cookies.
+## Provider
+
+The backend uses Apify actors instead of HikerAPI or direct Instagram requests from Render.
+
+Default actors:
+
+- profile/counts: `apify~instagram-profile-scraper`
+- followers/following: `scraping_solutions~instagram-scraper-followers-following-no-cookies`
+
+The relationship actor works with public profiles and supports continuation tokens. The backend
+follows continuations until the whole list has been collected.
+
+## Required Render environment
+
+- `APIFY_TOKEN`
+
+Create a free Apify account and put its API token only in Render. Do not put the token in the APK
+or GitHub.
 
 Optional:
 
-- MAX_MEMBERS (default: 500000)
+- `MAX_MEMBERS` (default 500000)
+- `APIFY_PAGE_SIZE` (default 1000, maximum 1000)
+- `APIFY_RUN_TIMEOUT` (default 150 seconds)
+- `APIFY_PROFILE_ACTOR`
+- `APIFY_RELATION_ACTOR`
 
-Never commit the session to GitHub. Keep IG_SESSION_JSON only in Render.
+The old `IG_SESSION_JSON` is not used by this collector.
 
-## Collector
+## Completeness model
 
-The collector is self-hosted and has no HikerAPI dependency or fallback.
+The backend deliberately mirrors the old Hiker flow:
 
-It uses direct authenticated HTTP requests to Instagram with the checker session.
-It does not use Chromium, Playwright, Firefox, WebKit, DOM scraping, or browser
-downloads.
+1. Fetch profile ID plus exact followers/following counts.
+2. Reject private targets.
+3. Fetch every followers page until continuation ends.
+4. Fetch every following page until continuation ends.
+5. Deduplicate by stable numeric Instagram ID.
+6. Require collected sizes to match the exact counts.
+7. Fetch the profile again.
+8. Require the same account ID and unchanged counts.
+9. Return `complete: true` only after every check passes.
 
-Profile resolution tries Instagram web_profile_info on the web and i.instagram
-hosts. If that identifies the account but exact counts are missing, the collector
-uses the Instagram user info endpoint. Search is only a last-resort way to resolve
-the numeric user ID; exact follower/following counts are still required before a
-snapshot starts.
+Partial data is never returned as a valid snapshot.
 
-Followers and following are fetched from Instagram friendship endpoints with
-next_max_id pagination. Members are keyed by stable Instagram numeric IDs, not
-usernames.
+## API compatibility
 
-The completeness rules match the previously working collector:
-
-1. Read exact follower and following counts before collection.
-2. Fetch every page until Instagram returns no next_max_id.
-3. Reject repeated cursors, malformed pages, rate limits, and partial lists.
-4. Read the exact profile counts again after collection.
-5. Reject the snapshot if the account ID or either count changed during collection.
-6. Return success only when both collected list sizes equal the exact counts.
-
-Private targets are not rejected in advance. If the checker account is allowed to
-read their lists, collection can proceed; otherwise Instagram's access response is
-returned as an error.
-
-## Run
-
-~~~bash
-python -m checker_backend.build
-uvicorn checker_backend.main:app --host 0.0.0.0 --port 10000 --workers 1
-~~~
-
-The build installs only Python dependencies. There is no browser installation.
-
-## Render
-
-Keep the existing pulse-checker service and URL.
-
-- Build command: python -m checker_backend.build
-- Start command: uvicorn checker_backend.main:app --host 0.0.0.0 --port $PORT --workers 1
-- Branch: main
-- Region: Frankfurt
-- IG_SESSION_JSON remains configured only as a Render secret
-
-Do not create a replacement service and do not use the Hiker backup branch.
-
-## Compatibility
-
-GET /health remains:
-
-- ok
-- engine = pulse-web-collector
-- session_configured
-- hiker_dependency = false
-
-POST /v1/collect keeps the Android response shape:
+`POST /v1/collect` remains compatible with the Android app:
 
 - account
 - captured_at
@@ -89,7 +65,17 @@ POST /v1/collect keeps the Android response shape:
 - complete
 - source
 
-Member objects remain id + username. IDs now use Instagram's stable numeric user ID,
-matching the behavior of the previously working data collector more closely.
+Each member remains `{id, username}`.
 
-Backend-only commits do not rebuild the APK.
+`GET /health` reports whether the online provider token is configured.
+
+## Render
+
+Keep the existing service:
+
+- service: `pulse-checker`
+- branch: `main`
+- build: `python -m checker_backend.build`
+- start: `uvicorn checker_backend.main:app --host 0.0.0.0 --port $PORT --workers 1`
+
+Do not create another Render service and do not modify the Hiker backup branch.

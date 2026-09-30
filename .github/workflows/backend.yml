@@ -1,4 +1,4 @@
-name: Backend direct Instagram collector
+name: Backend online Instagram collector
 
 on:
   push:
@@ -20,7 +20,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install direct HTTP collector
+      - name: Install online collector
         run: python -m checker_backend.build
       - name: Test API compatibility and complete pagination
         run: |

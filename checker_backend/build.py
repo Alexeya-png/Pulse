@@ -9,33 +9,19 @@ from pathlib import Path
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--with-deps",
-        action="store_true",
-        help="Compatibility flag; the HTTP collector needs no browser OS packages.",
-    )
+    parser.add_argument("--with-deps", action="store_true")
     parser.parse_args()
 
     requirements = Path(__file__).with_name("requirements.txt")
     subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-r",
-            str(requirements),
-        ],
+        [sys.executable, "-m", "pip", "install", "-r", str(requirements)],
         check=True,
     )
     subprocess.run(
         [
             sys.executable,
             "-c",
-            (
-                "import fastapi, requests, uvicorn; "
-                "print('Direct HTTP collector build check passed.')"
-            ),
+            "import fastapi, requests, uvicorn; print('Online collector build check passed.')",
         ],
         check=True,
     )
