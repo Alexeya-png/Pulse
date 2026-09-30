@@ -77,6 +77,82 @@ class ApiTests(unittest.TestCase):
             ("csrftoken", "csrf"),
         )
 
+    def test_429_respects_retry_after_then_succeeds(self):
+        session = MagicMock()
+        limited = MagicMock()
+        limited.url = "https://www.instagram.com/api/"
+        limited.status_code = 429
+        limited.headers = {"Retry-After": "7"}
+
+        ok = MagicMock()
+        ok.url = "https://www.instagram.com/api/"
+        ok.status_code = 200
+        ok.headers = {}
+        ok.json.return_value = {"ok": True}
+        session.get.side_effect = [limited, ok]
+
+        with patch.object(main, "_pace_request"), \
+                patch.object(main.time, "sleep") as sleep, \
+                patch.object(main, "IG_429_RETRIES", 2):
+            status, data = main._json_get(session, "https://example.test")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data, {"ok": True})
+        self.assertEqual(session.get.call_count, 2)
+        sleep.assert_called_once_with(7.0)
+
+    def test_429_uses_exponential_backoff_without_retry_after(self):
+        session = MagicMock()
+
+        limited1 = MagicMock()
+        limited1.url = "https://www.instagram.com/api/"
+        limited1.status_code = 429
+        limited1.headers = {}
+
+        limited2 = MagicMock()
+        limited2.url = "https://www.instagram.com/api/"
+        limited2.status_code = 429
+        limited2.headers = {}
+
+        ok = MagicMock()
+        ok.url = "https://www.instagram.com/api/"
+        ok.status_code = 200
+        ok.headers = {}
+        ok.json.return_value = {"ok": True}
+
+        session.get.side_effect = [limited1, limited2, ok]
+
+        with patch.object(main, "_pace_request"), \
+                patch.object(main.time, "sleep") as sleep, \
+                patch.object(main, "IG_429_RETRIES", 2), \
+                patch.object(main, "IG_429_BACKOFF", 4.0), \
+                patch.object(main, "IG_MAX_RETRY_AFTER", 120.0):
+            status, _ = main._json_get(session, "https://example.test")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [4.0, 8.0],
+        )
+
+    def test_429_exhaustion_returns_safe_503(self):
+        session = MagicMock()
+        limited = MagicMock()
+        limited.url = "https://www.instagram.com/api/"
+        limited.status_code = 429
+        limited.headers = {}
+        session.get.return_value = limited
+
+        with patch.object(main, "_pace_request"), \
+                patch.object(main.time, "sleep"), \
+                patch.object(main, "IG_429_RETRIES", 2):
+            with self.assertRaises(HTTPException) as error:
+                main._json_get(session, "https://example.test")
+
+        self.assertEqual(error.exception.status_code, 503)
+        self.assertIn("автоматических повторов", error.exception.detail)
+        self.assertEqual(session.get.call_count, 3)
+
     def test_web_profile_info_exact_edge_counts(self):
         session = MagicMock()
         data = {
