@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
 
-import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Pulse Checker", version="0.3.0")
+app = FastAPI(title="Pulse Checker", version="0.4.0")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
-HIKER_BASE_URL = os.environ.get("HIKER_BASE_URL", "https://api.hikerapi.com").rstrip("/")
+PLAYWRIGHT_BROWSERS_PATH = os.environ.setdefault(
+    "PLAYWRIGHT_BROWSERS_PATH", "/tmp/pulse-playwright"
+)
 
 _collect_lock = threading.Lock()
+_browser_lock = threading.Lock()
+_pw = None
+_browser = None
 
 
 class CollectRequest(BaseModel):
@@ -30,234 +37,317 @@ def _normal_username(value: str) -> str:
     return value
 
 
-def _api_key() -> str:
-    key = os.environ.get("HIKER_API_KEY", "").strip()
-    if not key:
+def _session_cookies() -> list[dict]:
+    raw = os.environ.get("IG_SESSION_JSON", "").strip()
+    if not raw:
         raise HTTPException(
             503,
-            "Сервис проверки ещё не настроен: добавьте HIKER_API_KEY в Render.",
+            "Нашему collector нужен IG_SESSION_JSON checker-аккаунта.",
         )
-    return key
-
-
-def _get(path: str, params: dict):
     try:
-        response = requests.get(
-            HIKER_BASE_URL + path,
-            params=params,
-            headers={
-                "x-access-key": _api_key(),
-                "accept": "application/json",
-                "user-agent": "PulseChecker/0.3",
-            },
-            timeout=(10, 60),
-        )
-    except requests.RequestException:
-        raise HTTPException(502, "Сервис Instagram-данных временно недоступен.") from None
-
-    if response.status_code in (401, 403):
-        raise HTTPException(
-            503,
-            "HikerAPI отклонил API-ключ. Проверьте HIKER_API_KEY в Render.",
-        )
-    if response.status_code == 404:
-        raise HTTPException(404, "Instagram-аккаунт не найден.")
-    if response.status_code == 429:
-        raise HTTPException(
-            429,
-            "Лимит запросов HikerAPI временно исчерпан. Попробуйте позже.",
-        )
-    if response.status_code >= 500:
-        raise HTTPException(502, "Сервис Instagram-данных временно недоступен.")
-    if response.status_code >= 400:
-        try:
-            detail = response.json()
-        except Exception:
-            detail = None
-        message = None
-        if isinstance(detail, dict):
-            message = detail.get("detail") or detail.get("message") or detail.get("error")
-        raise HTTPException(
-            502,
-            str(message or f"HikerAPI вернул ошибку {response.status_code}."),
-        )
-
-    try:
-        data = response.json()
+        data = json.loads(raw)
     except ValueError:
-        raise HTTPException(502, "Сервис Instagram-данных вернул повреждённый ответ.") from None
+        raise HTTPException(503, "IG_SESSION_JSON имеет неверный JSON.") from None
 
-    return data
+    if not isinstance(data, dict) or not data.get("sessionid"):
+        raise HTTPException(
+            503,
+            "IG_SESSION_JSON не содержит sessionid checker-аккаунта.",
+        )
+
+    cookies = []
+    for name, value in data.items():
+        if value is None:
+            continue
+        cookies.append(
+            {
+                "name": str(name),
+                "value": str(value),
+                "domain": ".instagram.com",
+                "path": "/",
+                "secure": True,
+                "httpOnly": name == "sessionid",
+                "sameSite": "Lax",
+            }
+        )
+    return cookies
 
 
-def _profile(username: str) -> dict:
-    data = _get("/v1/user/by/username", {"username": username})
-    if not isinstance(data, dict):
-        raise HTTPException(502, "HikerAPI вернул неожиданный ответ профиля.")
-    if not data.get("pk"):
-        raise HTTPException(404, "Instagram-аккаунт не найден.")
-    return data
+def _ensure_browser():
+    global _pw, _browser
+    with _browser_lock:
+        if _browser is not None:
+            return _browser
+
+        from playwright.sync_api import sync_playwright
+
+        os.makedirs(PLAYWRIGHT_BROWSERS_PATH, exist_ok=True)
+
+        try:
+            _pw = sync_playwright().start()
+            _browser = _pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
+            )
+            return _browser
+        except Exception as first_error:
+            if _pw is not None:
+                try:
+                    _pw.stop()
+                except Exception:
+                    pass
+                _pw = None
+
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                    check=True,
+                    timeout=240,
+                )
+                _pw = sync_playwright().start()
+                _browser = _pw.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                    ],
+                )
+                return _browser
+            except Exception as exc:
+                raise HTTPException(
+                    503,
+                    f"Не удалось запустить наш браузер collector: {exc.__class__.__name__}.",
+                ) from first_error
 
 
-def _member(row: dict) -> dict:
-    if not isinstance(row, dict):
-        raise HTTPException(502, "Сервис вернул некорректный элемент списка.")
-    user_id = row.get("pk") or row.get("id")
-    value = row.get("username")
-    if user_id is None or not value:
-        raise HTTPException(502, "Сервис вернул неполные данные пользователя.")
-    return {"id": str(user_id), "username": str(value).lower()}
+def _make_page():
+    browser = _ensure_browser()
+    context = browser.new_context(
+        viewport={"width": 1280, "height": 900},
+        locale="en-US",
+        timezone_id="UTC",
+    )
+    context.add_cookies(_session_cookies())
+    page = context.new_page()
+    page.set_default_timeout(15000)
+    return context, page
 
 
-def _collect_pages(
-    path: str,
-    user_id: str,
-    label: str,
-    cursor_param: str,
-    cursor_field: str,
-) -> list[dict]:
-    result: dict[str, dict] = {}
-    cursor = None
-    seen_cursors = set()
+def _assert_logged_in(page) -> None:
+    page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(1500)
+    url = page.url.lower()
+    if "/challenge/" in url or "/checkpoint/" in url:
+        raise HTTPException(
+            503,
+            "Instagram просит подтвердить checker-аккаунт. Откройте его в обычном Instagram и подтвердите вход.",
+        )
+    if "/accounts/login" in url:
+        raise HTTPException(
+            503,
+            "IG_SESSION_JSON checker-аккаунта истёк. Создайте новую Chrome-сессию.",
+        )
 
-    while True:
-        params = {"user_id": user_id}
-        if cursor:
-            params[cursor_param] = cursor
 
-        page = _get(path, params)
+def _exact_count(page, target: str, kind: str) -> int | None:
+    href = f"/{target}/{kind}/"
+    value = page.evaluate(
+        """href => {
+            const a = [...document.querySelectorAll('a[href]')]
+                .find(x => {
+                    try { return new URL(x.href).pathname.toLowerCase() === href.toLowerCase(); }
+                    catch (_) { return false; }
+                });
+            if (!a) return null;
+            const titled = a.querySelector('[title]')?.getAttribute('title');
+            return titled || a.getAttribute('aria-label') || a.textContent || null;
+        }""",
+        href,
+    )
+    if not value:
+        return None
+    text = str(value).strip().lower()
+    if re.search(r"\b[\d.,]+\s*[km]\b", text):
+        return None
+    match = re.search(r"(\d[\d\s,.]*)", text)
+    if not match:
+        return None
+    digits = re.sub(r"\D", "", match.group(1))
+    return int(digits) if digits else None
 
-        if isinstance(page, list) and len(page) >= 1:
-            users = page[0]
-            next_cursor = page[1] if len(page) > 1 else None
-        elif isinstance(page, dict):
-            users = page.get("users")
-            next_cursor = page.get(cursor_field)
-        else:
-            raise HTTPException(502, f"{label}: HikerAPI вернул неожиданный формат страницы.")
 
-        if not isinstance(users, list):
-            raise HTTPException(502, f"{label}: сервис вернул неполную страницу.")
+def _open_relation(page, target: str, kind: str):
+    href = f"/{target}/{kind}/"
+    locator = page.locator(f'a[href="{href}"]').first
+    if locator.count() == 0:
+        raise HTTPException(
+            403,
+            "Instagram не показывает этот список checker-аккаунту.",
+        )
+    locator.click()
+    dialog = page.locator('div[role="dialog"]').last
+    dialog.wait_for(state="visible", timeout=15000)
+    return dialog
 
-        for row in users:
-            member = _member(row)
-            result[member["id"]] = member
-            if len(result) > MAX_MEMBERS:
-                raise HTTPException(413, f"{label}: список больше лимита сервера.")
 
-        if not next_cursor:
+def _extract_usernames(dialog) -> dict[str, dict]:
+    rows = dialog.evaluate(
+        """dialog => {
+            const out = [];
+            for (const a of dialog.querySelectorAll('a[href]')) {
+                let path;
+                try { path = new URL(a.href).pathname; } catch (_) { continue; }
+                const m = path.match(/^\/([A-Za-z0-9._]{1,30})\/$/);
+                if (!m) continue;
+                const u = m[1].toLowerCase();
+                if (['accounts','explore','reels','direct'].includes(u)) continue;
+                out.push(u);
+            }
+            return [...new Set(out)];
+        }"""
+    )
+    return {u: {"id": u, "username": u} for u in rows if USERNAME_RE.fullmatch(u)}
+
+
+def _scroll_relation(dialog, expected: int | None, label: str) -> list[dict]:
+    found: dict[str, dict] = {}
+    stable_rounds = 0
+    last_count = -1
+
+    for _ in range(1200):
+        found.update(_extract_usernames(dialog))
+        if len(found) > MAX_MEMBERS:
+            raise HTTPException(413, f"{label}: список больше лимита сервера.")
+
+        if expected is not None and len(found) >= expected:
             break
 
-        next_cursor = str(next_cursor)
-        if next_cursor in seen_cursors:
-            raise HTTPException(502, f"{label}: зациклилась пагинация. Снимок не сохранён.")
-        seen_cursors.add(next_cursor)
-        cursor = next_cursor
-        time.sleep(0.03)
+        state = dialog.evaluate(
+            """dialog => {
+                const all = [dialog, ...dialog.querySelectorAll('*')];
+                const candidates = all.filter(
+                    e => e.scrollHeight > e.clientHeight + 20
+                );
+                candidates.sort((a,b) => (b.scrollHeight-b.clientHeight) - (a.scrollHeight-a.clientHeight));
+                const sc = candidates[0];
+                if (!sc) return {moved:false, end:true};
+                const before = sc.scrollTop;
+                sc.scrollTop = Math.min(
+                    sc.scrollHeight,
+                    sc.scrollTop + Math.max(500, sc.clientHeight * 0.85)
+                );
+                const end = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 8;
+                return {moved: sc.scrollTop !== before, end};
+            }"""
+        )
 
-    return list(result.values())
+        if len(found) == last_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+            last_count = len(found)
+
+        if state.get("end") and stable_rounds >= 8:
+            break
+        if stable_rounds >= 18:
+            break
+        time.sleep(0.35)
+
+    found.update(_extract_usernames(dialog))
+    return list(found.values())
 
 
-def _collect_with_fallback(kind: str, user_id: str, expected: int, label: str) -> list[dict]:
-    if expected > MAX_MEMBERS:
-        raise HTTPException(413, f"{label}: список больше лимита сервера.")
+def _collect_profile(target: str) -> dict:
+    context = None
+    try:
+        context, page = _make_page()
+        _assert_logged_in(page)
 
-    v1 = _collect_pages(
-        f"/v1/user/{kind}/chunk",
-        user_id,
-        label,
-        "max_id",
-        "next_max_id",
-    )
-    if len(v1) == expected:
-        return v1
+        page.goto(
+            f"https://www.instagram.com/{target}/",
+            wait_until="domcontentloaded",
+            timeout=45000,
+        )
+        page.wait_for_timeout(1800)
 
-    gql = _collect_pages(
-        f"/gql/user/{kind}/chunk",
-        user_id,
-        label,
-        "end_cursor",
-        "end_cursor",
-    )
-    if len(gql) == expected:
-        return gql
+        body = page.locator("body").inner_text(timeout=10000).lower()
+        if "sorry, this page isn't available" in body:
+            raise HTTPException(404, "Instagram-аккаунт не найден.")
 
-    return gql if len(gql) >= len(v1) else v1
+        expected_followers = _exact_count(page, target, "followers")
+        expected_following = _exact_count(page, target, "following")
+
+        followers_dialog = _open_relation(page, target, "followers")
+        followers = _scroll_relation(
+            followers_dialog, expected_followers, "Подписчики"
+        )
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(500)
+
+        following_dialog = _open_relation(page, target, "following")
+        following = _scroll_relation(
+            following_dialog, expected_following, "Подписки"
+        )
+        page.keyboard.press("Escape")
+
+        if expected_followers is None or expected_following is None:
+            raise HTTPException(
+                409,
+                "Не удалось подтвердить точное количество списков. Снимок не сохранён.",
+            )
+        if len(followers) != expected_followers:
+            raise HTTPException(
+                409,
+                f"Подписчики: получено {len(followers)} из {expected_followers}. Снимок не сохранён.",
+            )
+        if len(following) != expected_following:
+            raise HTTPException(
+                409,
+                f"Подписки: получено {len(following)} из {expected_following}. Снимок не сохранён.",
+            )
+
+        return {
+            "account": target,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "followers_count": expected_followers,
+            "following_count": expected_following,
+            "followers": followers,
+            "following": following,
+            "complete": True,
+            "source": "pulse-web-collector",
+        }
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
 
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
-        "engine": "hikerapi",
-        "api_key_configured": bool(os.environ.get("HIKER_API_KEY")),
+        "engine": "pulse-web-collector",
+        "session_configured": bool(os.environ.get("IG_SESSION_JSON")),
+        "hiker_dependency": False,
     }
 
 
 @app.post("/v1/collect")
 def collect(request: CollectRequest):
     target = _normal_username(request.username)
-
     if not _collect_lock.acquire(blocking=False):
-        raise HTTPException(429, "Сейчас уже выполняется другая проверка. Попробуйте позже.")
-
+        raise HTTPException(
+            429,
+            "Сейчас уже выполняется другая проверка. Попробуйте позже.",
+        )
     try:
-        before = _profile(target)
-
-        if bool(before.get("is_private")):
-            raise HTTPException(
-                403,
-                "Этот режим поддерживает только публичные Instagram-аккаунты.",
-            )
-
-        user_id = str(before["pk"])
-        before_followers = int(before.get("follower_count") or 0)
-        before_following = int(before.get("following_count") or 0)
-
-        followers = _collect_with_fallback(
-            "followers",
-            user_id,
-            before_followers,
-            "Подписчики",
-        )
-        following = _collect_with_fallback(
-            "following",
-            user_id,
-            before_following,
-            "Подписки",
-        )
-
-        after = _profile(target)
-        if str(after.get("pk")) != user_id:
-            raise HTTPException(
-                409,
-                "Аккаунт изменился во время проверки. Запустите сбор ещё раз.",
-            )
-
-        after_followers = int(after.get("follower_count") or 0)
-        after_following = int(after.get("following_count") or 0)
-
-        if len(followers) != after_followers:
-            raise HTTPException(
-                409,
-                f"Подписчики: получено {len(followers)} из {after_followers}. Снимок не сохранён.",
-            )
-        if len(following) != after_following:
-            raise HTTPException(
-                409,
-                f"Подписки: получено {len(following)} из {after_following}. Снимок не сохранён.",
-            )
-
-        return {
-            "account": target,
-            "account_id": user_id,
-            "captured_at": datetime.now(timezone.utc).isoformat(),
-            "followers_count": after_followers,
-            "following_count": after_following,
-            "followers": followers,
-            "following": following,
-            "complete": True,
-            "source": "hikerapi",
-        }
+        return _collect_profile(target)
     finally:
         _collect_lock.release()
