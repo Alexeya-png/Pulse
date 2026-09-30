@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from urllib3.util import Timeout
 
-app = FastAPI(title="Pulse Checker", version="0.5.7")
+app = FastAPI(title="Pulse Checker", version="0.5.8")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -50,6 +50,10 @@ APIFY_FREE_FOLLOWING_ACTOR = os.environ.get(
 APIFY_OFFICIAL_RELATION_ACTOR = os.environ.get(
     "APIFY_OFFICIAL_RELATION_ACTOR",
     "apify~instagram-followers-following-scraper",
+)
+APIFY_CODERX_RELATION_ACTOR = os.environ.get(
+    "APIFY_CODERX_RELATION_ACTOR",
+    "coderx~instagram-followers-following-scraper-no-cookies-login",
 )
 APIFY_PAGE_SIZE = min(1000, max(1, int(os.environ.get("APIFY_PAGE_SIZE", "1000"))))
 APIFY_POLL_SECONDS = max(0.2, float(os.environ.get("APIFY_POLL_SECONDS", "1.5")))
@@ -403,7 +407,7 @@ def _member(row: dict, username: str, data_type: str) -> dict:
     if row_type and row_type != expected_type:
         raise HTTPException(502, "Онлайн-collector смешал followers и following.")
 
-    user_id = row.get("id") or row.get("userId")
+    user_id = row.get("id") or row.get("userId") or row.get("pk")
     member_username = str(row.get("username") or "").strip().lower()
     if user_id is None or not USERNAME_RE.fullmatch(member_username):
         raise HTTPException(502, "Онлайн-collector вернул неполные данные пользователя.")
@@ -671,6 +675,60 @@ def _collect_official_actor(
         )
     logger.info(
         "Apify public actor returned %d/%d for %s",
+        len(found),
+        expected,
+        label,
+    )
+    return list(found.values())
+
+
+def _collect_coderx_actor(
+    username: str,
+    expected: int,
+    data_type: str,
+    label: str,
+) -> list[dict]:
+    if expected > 1000:
+        return []
+
+    list_type = (
+        "followers"
+        if data_type.strip().lower() in {"follower", "followers"}
+        else "following"
+    )
+    run = _start_actor(
+        APIFY_CODERX_RELATION_ACTOR,
+        {
+            "username": username,
+            "scrape_type": list_type,
+            "max_items": max(25, min(expected, 1000)),
+        },
+    )
+    run = _wait_run(str(run["id"]))
+    dataset_id = run.get("defaultDatasetId")
+    if not dataset_id:
+        raise HTTPException(
+            502,
+            f"{label}: independent-provider не создал результат.",
+        )
+
+    rows = _dataset_items(str(dataset_id))
+    found: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if not row.get("username"):
+            continue
+        member = _member(row, username, data_type)
+        found[member["id"]] = member
+        if len(found) > expected:
+            raise HTTPException(
+                409,
+                f"{label}: список изменился во время проверки. Снимок не сохранён.",
+            )
+
+    logger.info(
+        "Apify independent no-cookie actor returned %d/%d for %s",
         len(found),
         expected,
         label,
@@ -965,6 +1023,41 @@ def _collect_relation(
             )
             if attempt + 1 < APIFY_RELATION_ATTEMPTS and APIFY_RETRY_DELAY:
                 _pause(APIFY_RETRY_DELAY)
+
+    if is_following and APIFY_CODERX_RELATION_ACTOR and len(combined) < expected:
+        try:
+            result = _collect_coderx_actor(
+                username,
+                expected,
+                data_type,
+                label,
+            )
+        except HTTPException as exc:
+            if isinstance(exc, CollectionTimeout) or exc.status_code in (401, 403, 409, 429):
+                raise
+            logger.warning(
+                "Apify independent no-cookie actor failed for %s (%d)",
+                label,
+                exc.status_code,
+            )
+            result = []
+
+        for member in result:
+            combined[member["id"]] = member
+        if len(combined) > expected:
+            raise HTTPException(
+                409,
+                f"{label}: данные изменились во время сбора. Снимок не сохранён.",
+            )
+        if len(combined) == expected:
+            return list(combined.values())
+
+        logger.warning(
+            "Apify independent no-cookie actor produced %d rows; combined %d/%d",
+            len(result),
+            len(combined),
+            expected,
+        )
 
     raise HTTPException(
         409,

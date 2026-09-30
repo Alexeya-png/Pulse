@@ -310,6 +310,38 @@ class ApiTests(unittest.TestCase):
             "resultsLimit": 1,
         })
 
+
+    def test_coderx_actor_uses_independent_following_schema(self):
+        run = {"id": "r1", "defaultDatasetId": "d1"}
+        rows = [
+            {"pk": "110", "username": "MissingUser"},
+            {"cursor": "50", "total_scraped": 50},
+        ]
+        captured = {}
+
+        def start(actor, body):
+            captured["actor"] = actor
+            captured["body"] = body
+            return run
+
+        with patch.object(main, "_start_actor", side_effect=start), \
+                patch.object(main, "_wait_run", return_value=run), \
+                patch.object(main, "_dataset_items", return_value=rows):
+            result = main._collect_coderx_actor(
+                "example",
+                110,
+                "Followings",
+                "Подписки",
+            )
+
+        self.assertEqual(result, [{"id": "110", "username": "missinguser"}])
+        self.assertEqual(captured["actor"], main.APIFY_CODERX_RELATION_ACTOR)
+        self.assertEqual(captured["body"], {
+            "username": "example",
+            "scrape_type": "following",
+            "max_items": 110,
+        })
+
     def test_following_uses_full_provider_first(self):
         full_rows = [
             {"id": "1", "username": "alice"},
@@ -430,6 +462,55 @@ class ApiTests(unittest.TestCase):
         self.assertEqual({item["id"] for item in result}, {str(i) for i in range(1, 111)})
         fallback.assert_called_once()
 
+
+    def test_coderx_fallback_can_fill_last_missing_following(self):
+        exposed = [
+            {"id": str(i), "username": f"user{i}"}
+            for i in range(1, 110)
+        ]
+        missing = [{"id": "110", "username": "user110"}]
+
+        with patch.object(
+            main,
+            "_collect_full_following_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_free_following_actor",
+            return_value=exposed,
+        ), patch.object(
+            main,
+            "_collect_official_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_session_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_relation_from_actor",
+            return_value=exposed,
+        ), patch.object(
+            main,
+            "_collect_coderx_actor",
+            return_value=missing,
+        ) as independent:
+            result = main._collect_relation(
+                "example",
+                110,
+                "Followings",
+                "Подписки",
+            )
+
+        self.assertEqual(len(result), 110)
+        self.assertEqual({item["id"] for item in result}, {str(i) for i in range(1, 111)})
+        independent.assert_called_once_with(
+            "example",
+            110,
+            "Followings",
+            "Подписки",
+        )
+
     def test_relation_rejects_one_hidden_record_for_large_list(self):
         exposed = [
             {"id": str(i), "username": f"user{i}"}
@@ -455,6 +536,10 @@ class ApiTests(unittest.TestCase):
             main,
             "_collect_relation_from_actor",
             return_value=exposed,
+        ), patch.object(
+            main,
+            "_collect_coderx_actor",
+            return_value=[],
         ):
             with self.assertRaises(HTTPException) as error:
                 main._collect_relation(
@@ -490,6 +575,10 @@ class ApiTests(unittest.TestCase):
             main,
             "_collect_relation_from_actor",
             return_value=exposed,
+        ), patch.object(
+            main,
+            "_collect_coderx_actor",
+            return_value=[],
         ):
             with self.assertRaises(HTTPException) as error:
                 main._collect_relation(
