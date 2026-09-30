@@ -137,6 +137,28 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data, {"status": "ok"})
 
+    def test_direct_relationship_hosts_merge_unique_ids(self):
+        session = direct_instagram.requests.Session()
+        pages = [
+            ([{"pk": "1", "username": "alice"}, {"pk": "2", "username": "bob"}], None),
+            ([{"pk": "2", "username": "bob"}, {"pk": "3", "username": "carol"}], None),
+        ]
+        with patch.object(
+            direct_instagram,
+            "_relation_page_from_base",
+            side_effect=pages,
+        ):
+            result = direct_instagram._collect_pages(
+                session,
+                "123",
+                "following",
+                3,
+                "Подписки",
+                time.monotonic() + 10,
+            )
+        session.close()
+        self.assertEqual({item["id"] for item in result}, {"1", "2", "3"})
+
     def test_direct_transport_returns_429_so_other_endpoints_can_run(self):
         primary = direct_instagram.requests.Session()
         alternatives = [
