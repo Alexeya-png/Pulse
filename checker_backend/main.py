@@ -7,16 +7,21 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Pulse Checker", version="0.4.0")
+app = FastAPI(title="Pulse Checker", version="0.4.1")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
 IG_WEB_APP_ID = "936619743392459"
+IG_REQUEST_DELAY = max(0.0, float(os.environ.get("IG_REQUEST_DELAY", "1.0")))
+IG_429_RETRIES = max(0, int(os.environ.get("IG_429_RETRIES", "4")))
+IG_429_BACKOFF = max(0.5, float(os.environ.get("IG_429_BACKOFF", "4")))
+IG_MAX_RETRY_AFTER = max(1.0, float(os.environ.get("IG_MAX_RETRY_AFTER", "120")))
 PROFILE_URLS = (
     "https://www.instagram.com/api/v1/users/web_profile_info/",
     "https://i.instagram.com/api/v1/users/web_profile_info/",
@@ -26,6 +31,8 @@ RELATION_BASES = (
     "https://www.instagram.com/api/v1/friendships",
 )
 _collect_lock = threading.Lock()
+_request_pace_lock = threading.Lock()
+_last_request_at = 0.0
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -69,40 +76,92 @@ def _make_session() -> requests.Session:
     return session
 
 
+def _pace_request() -> None:
+    global _last_request_at
+    if IG_REQUEST_DELAY <= 0:
+        return
+    with _request_pace_lock:
+        now = time.monotonic()
+        wait = IG_REQUEST_DELAY - (now - _last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_at = time.monotonic()
+
+
+def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
+    raw = str(response.headers.get("Retry-After") or "").strip()
+    if raw:
+        if raw.isdigit():
+            return min(float(raw), IG_MAX_RETRY_AFTER)
+        try:
+            retry_at = parsedate_to_datetime(raw)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            if seconds > 0:
+                return min(seconds, IG_MAX_RETRY_AFTER)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return min(IG_429_BACKOFF * (2 ** attempt), IG_MAX_RETRY_AFTER)
+
+
 def _json_get(
     session: requests.Session,
     url: str,
     params: dict | None = None,
 ) -> tuple[int, dict | None]:
-    try:
-        response = session.get(
-            url,
-            params=params,
-            timeout=(10, 45),
-            allow_redirects=True,
-        )
-    except requests.RequestException:
-        raise HTTPException(
-            502,
-            "Instagram временно недоступен для нашего collector.",
-        ) from None
+    response = None
+    for attempt in range(IG_429_RETRIES + 1):
+        _pace_request()
+        try:
+            response = session.get(
+                url,
+                params=params,
+                timeout=(10, 45),
+                allow_redirects=True,
+            )
+        except requests.RequestException:
+            raise HTTPException(
+                502,
+                "Instagram временно недоступен для нашего collector.",
+            ) from None
 
-    final_url = response.url.lower()
-    if "/challenge/" in final_url or "/checkpoint/" in final_url:
-        raise HTTPException(
-            503,
-            "Instagram просит подтвердить checker-аккаунт.",
+        final_url = response.url.lower()
+        if "/challenge/" in final_url or "/checkpoint/" in final_url:
+            raise HTTPException(
+                503,
+                "Instagram просит подтвердить checker-аккаунт.",
+            )
+        if "/accounts/login" in final_url:
+            raise HTTPException(
+                503,
+                "IG_SESSION_JSON checker-аккаунта истёк. Создайте новую Chrome-сессию.",
+            )
+
+        if response.status_code != 429:
+            break
+
+        if attempt >= IG_429_RETRIES:
+            logger.warning(
+                "Instagram 429 persisted after %d retries",
+                IG_429_RETRIES,
+            )
+            raise HTTPException(
+                503,
+                "Instagram продолжает ограничивать запросы после автоматических повторов. Подождите и запустите проверку позже.",
+            )
+
+        delay = _retry_after_seconds(response, attempt)
+        logger.warning(
+            "Instagram 429; retrying in %.1fs (%d/%d)",
+            delay,
+            attempt + 1,
+            IG_429_RETRIES,
         )
-    if "/accounts/login" in final_url:
-        raise HTTPException(
-            503,
-            "IG_SESSION_JSON checker-аккаунта истёк. Создайте новую Chrome-сессию.",
-        )
-    if response.status_code == 429:
-        raise HTTPException(
-            503,
-            "Instagram временно ограничил запросы checker-аккаунта. Попробуйте позже.",
-        )
+        time.sleep(delay)
+
+    if response is None:
+        raise HTTPException(502, "Instagram не вернул ответ.")
 
     try:
         data = response.json()
@@ -378,7 +437,6 @@ def _collect_pages(
             )
         seen_cursors.add(next_max_id)
         max_id = next_max_id
-        time.sleep(0.08)
 
     if len(result) != expected:
         raise HTTPException(
