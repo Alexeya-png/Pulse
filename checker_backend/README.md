@@ -67,6 +67,8 @@ never commit it or put it in the APK. The fallback can fail when Instagram limit
 
 Partial data is never returned as a valid snapshot.
 
+For `following`, incomplete results from the primary/free/public/session providers are merged with the two continuation-capable relationship fallbacks before the snapshot is rejected.
+
 Both workers share the same request deadline, including profile rechecks, HTTP calls and
 retries. The backend stops an unfinished actor run if polling fails or the deadline expires,
 and always releases the collection lock. A second collection receives HTTP 429 while one
