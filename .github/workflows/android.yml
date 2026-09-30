@@ -1,0 +1,71 @@
+name: Android debug APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev automake autopoint gettext
+          python -m pip install buildozer==1.6.0 'Cython<3' setuptools wheel
+
+      - name: Build APK
+        shell: bash
+        working-directory: pulse
+        run: |
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee build-android.log
+
+      - name: Verify APK signature and record checksum
+        shell: bash
+        working-directory: pulse
+        run: |
+          set -euo pipefail
+          sdk="$HOME/.buildozer/android/platform/android-sdk"
+          signer=$(find "$sdk/build-tools" -type f -name apksigner | sort -V | tail -1)
+          test -n "$signer"
+          shopt -s nullglob
+          apks=(bin/*.apk)
+          test "${#apks[@]}" -gt 0
+          for apk in "${apks[@]}"; do
+            "$signer" verify --verbose "$apk"
+          done
+          (cd bin && sha256sum *.apk > SHA256SUMS.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pulse-android-debug
+          path: |
+            pulse/bin/*.apk
+            pulse/bin/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Save build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulse-build-log
+          path: pulse/build-android.log
+          if-no-files-found: ignore
