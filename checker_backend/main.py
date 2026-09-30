@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from urllib3.util import Timeout
 
-app = FastAPI(title="Pulse Checker", version="0.6.0")
+app = FastAPI(title="Pulse Checker", version="0.6.1")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -196,9 +196,22 @@ def _request_json(
     if allow_404 and response.status_code == 404:
         return None
     if response.status_code in (401, 403):
+        error_type = _safe_apify_error_type(response)
+        logger.warning(
+            "Apify access rejected status=%d type=%s path=%s",
+            response.status_code,
+            error_type,
+            path.split("?")[0],
+        )
+        quota_markers = ("limit", "quota", "credit", "usage", "balance", "billing", "rental")
+        if any(marker in error_type for marker in quota_markers):
+            raise HTTPException(
+                429,
+                "Лимит Apify для онлайн-collector исчерпан или запуск этого Actor недоступен на текущем плане.",
+            )
         raise HTTPException(
             503,
-            "Apify отклонил API-токен. Проверьте APIFY_TOKEN в Render.",
+            "Apify отклонил доступ к Actor. Проверьте APIFY_TOKEN и доступ плана в Render.",
         )
     if response.status_code == 402:
         raise HTTPException(
@@ -230,6 +243,25 @@ def _request_json(
             502,
             "Онлайн-collector вернул повреждённый ответ.",
         ) from None
+
+
+def _safe_apify_error_type(response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return "unknown"
+    values = []
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            values.extend([error.get("type"), error.get("code")])
+        values.extend([payload.get("type"), payload.get("code")])
+    for value in values:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if re.fullmatch(r"[a-z0-9_.-]{1,80}", normalized):
+                return normalized
+    return "unknown"
 
 
 def _as_int(value) -> int | None:
