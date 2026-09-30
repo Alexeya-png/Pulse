@@ -153,6 +153,12 @@ class PulseApp(App):
         if platform != "android":
             Window.size = (420, 850)
         Window.clearcolor = BG
+        if platform == "android":
+            try:
+                from .android_import import configure_android_system_bars
+                configure_android_system_bars()
+            except Exception:
+                pass
         self.data_dir = Path(os.environ.get("PULSE_HOME") or self.user_data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.config_path = self.data_dir / "preferences.json"
@@ -160,6 +166,10 @@ class PulseApp(App):
             self.prefs = json.loads(self.config_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             self.prefs = {}
+        if not self.prefs.get("instagram_app_flow_v2"):
+            self.prefs["export_pending"] = False
+            self.prefs["instagram_app_flow_v2"] = True
+            self.save_prefs()
         self.real_store = Store(self.data_dir / "pulse.sqlite3")
         self.store = self.real_store
         if self.demo_mode:
@@ -331,13 +341,23 @@ class PulseApp(App):
             self.prefs["export_pending"] = True
             self.save_prefs()
             self._update_collection_button()
-            self.message("В Instagram выберите Followers and following → JSON → All time. После скачивания ZIP просто вернитесь в Pulse — выбор файла откроется автоматически.")
-            open_instagram_export()
+            self.message(
+                "Открываем установленный Instagram. Если экспорт не открылся сразу: "
+                "Профиль → ☰ → Центр аккаунтов → Ваша информация и разрешения → Экспорт информации."
+            )
+
+            def open_failed(message):
+                self.prefs["export_pending"] = False
+                self.save_prefs()
+                self._update_collection_button()
+                self.message(message or "Не удалось открыть приложение Instagram.")
+
+            open_instagram_export(open_failed)
         except Exception:
             self.prefs["export_pending"] = False
             self.save_prefs()
             self._update_collection_button()
-            self.message("Не удалось открыть экспорт Instagram.")
+            self.message("Не удалось открыть приложение Instagram.")
 
     def refresh(self):
         if not hasattr(self, "rv"):
@@ -452,7 +472,10 @@ class PulseApp(App):
 
         def cancelled():
             unlock()
-            self.message("Выбор файла отменён. Когда ZIP будет готов, нажмите кнопку ещё раз.")
+            self.prefs["export_pending"] = False
+            self.save_prefs()
+            self._update_collection_button()
+            self.message("Выбор файла отменён. Нажмите «Собрать данные», чтобы снова открыть Instagram.")
 
         def failed(message):
             unlock()
@@ -520,9 +543,9 @@ class PulseApp(App):
     def help_dialog(self):
         self.dialog(
             "Как работает Pulse",
-            "1. Нажмите «Собрать данные». Pulse откроет официальный экспорт Instagram.\n\n"
-            "2. Выберите Followers and following, JSON и All time. Скачайте готовый ZIP.\n\n"
-            "3. После скачивания ZIP вернитесь в Pulse. Выбор файла откроется автоматически — выберите ZIP. Первый сбор станет точкой отсчёта.\n\n"
+            "1. Нажмите «Собрать данные». Pulse откроет установленное приложение Instagram с вашим текущим аккаунтом.\n\n"
+            "2. Если раздел экспорта не открылся сразу: Профиль → ☰ → Центр аккаунтов → Ваша информация и разрешения → Экспорт информации. Выберите Followers and following, JSON и All time.\n\n"
+            "3. Скачайте ZIP, вернитесь в Pulse и нажмите «Выбрать готовый ZIP». Первый сбор станет точкой отсчёта.\n\n"
             "4. Позже нажмите «Собрать снова и проверить», получите новый ZIP и выберите его. Pulse сравнит два сбора и покажет отписки, новых и невзаимные подписки."
         )
 
@@ -533,10 +556,9 @@ class PulseApp(App):
 
     def on_resume(self):
         self.paused = False
-        if self.prefs.get("export_pending") and not self.busy and not self.file_picker:
+        if self.prefs.get("export_pending"):
             self._update_collection_button()
-            self.message("Выберите скачанный ZIP Instagram.")
-            Clock.schedule_once(lambda _: self.import_export(), 0.6)
+            self.message("Когда архив Instagram будет скачан, нажмите «Выбрать готовый ZIP».")
 
     def on_stop(self):
         self.stopping = True
