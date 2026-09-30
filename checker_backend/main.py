@@ -6,7 +6,6 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import requests
@@ -14,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from urllib3.util import Timeout
 
-app = FastAPI(title="Pulse Checker", version="0.5.9")
+app = FastAPI(title="Pulse Checker", version="0.6.0")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -1168,16 +1167,6 @@ def _collect_relation(
     )
 
 
-def _relation_with_deadline(deadline: float, *args) -> list[dict]:
-    # Thread-local deadlines must be copied explicitly to the two list workers.
-    _collection_state.deadline = deadline
-    try:
-        _remaining()
-        return _collect_relation(*args)
-    finally:
-        _collection_state.deadline = None
-
-
 def _collect_profile(target: str) -> dict:
     before = _profile(target)
     if before["is_private"]:
@@ -1195,16 +1184,23 @@ def _collect_profile(target: str) -> dict:
         following_count,
     )
 
-    deadline = time.monotonic() + _remaining()
-    with ThreadPoolExecutor(max_workers=2) as workers:
-        following_job = workers.submit(
-            _relation_with_deadline, deadline, target, following_count, "Followings", "Подписки",
-        )
-        followers_job = workers.submit(
-            _relation_with_deadline, deadline, target, followers_count, "Followers", "Подписчики",
-        )
-        following = following_job.result()
-        followers = followers_job.result()
+    # Apify FREE effectively permits one active Actor run at a time. Running
+    # followers and following concurrently causes the second branch to receive
+    # 403/authorization-looking errors while the first Actor still owns the slot.
+    # Keep one shared request deadline, but serialize the two relationship lists.
+    following = _collect_relation(
+        target,
+        following_count,
+        "Followings",
+        "Подписки",
+    )
+    _remaining()
+    followers = _collect_relation(
+        target,
+        followers_count,
+        "Followers",
+        "Подписчики",
+    )
 
     after = _profile(target)
     if after["id"] != user_id:

@@ -949,20 +949,22 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(timeout.total, 4)
         self.assertEqual(timeout.connect_timeout, 4)
 
-    def test_lists_run_concurrently_with_shared_deadline(self):
+    def test_lists_run_sequentially_with_shared_deadline(self):
         profile = {"id": "123", "username": "example", "followers_count": 1, "following_count": 1, "is_private": False}
-        barrier = threading.Barrier(2)
+        calls = []
         deadlines = []
 
-        def relation(*args):
+        def relation(account, expected, data_type, label):
+            calls.append(data_type)
             deadlines.append(main._collection_state.deadline)
-            barrier.wait(timeout=2)
             return [{"id": "1", "username": "alice"}]
 
         with patch.object(main, "_profile", return_value=profile), patch.object(main, "_collect_relation", side_effect=relation):
             response = self.client.post("/v1/collect", json={"username": "example"})
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(calls, ["Followings", "Followers"])
         self.assertEqual(len(deadlines), 2)
+        self.assertIsNotNone(deadlines[0])
         self.assertEqual(deadlines[0], deadlines[1])
 
     def test_final_snapshot_rejects_mismatched_lengths(self):
