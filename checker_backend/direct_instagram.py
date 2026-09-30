@@ -35,6 +35,13 @@ RELATION_BASES = (
     "https://i.instagram.com/api/v1/friendships",
     "https://www.instagram.com/api/v1/friendships",
 )
+RELATION_VARIANTS = (
+    ("surface-100", {"count": 100, "search_surface": "follow_list_page"}),
+    ("plain-100", {"count": 100}),
+    ("surface-50", {"count": 50, "search_surface": "follow_list_page"}),
+    ("plain-50", {"count": 50}),
+    ("plain-200", {"count": 200}),
+)
 _pace_lock = threading.Lock()
 _last_request_at = 0.0
 logger = logging.getLogger("uvicorn.error")
@@ -450,6 +457,26 @@ def _member(row: dict) -> dict:
     return {"id": str(user_id), "username": username}
 
 
+def _relationship_sessions(
+    source: requests.Session,
+) -> list[tuple[str, requests.Session, bool]]:
+    cookies = requests.utils.dict_from_cookiejar(source.cookies)
+    variants: list[tuple[str, requests.Session, bool]] = [
+        ("primary-browser", source, False),
+    ]
+
+    minimal = requests.Session()
+    minimal.headers.update(_session_headers(IG_BROWSER_UA))
+    _apply_cookies(minimal, cookies, minimal=True)
+    variants.append(("minimal-browser", minimal, True))
+
+    mobile = requests.Session()
+    mobile.headers.update(_session_headers(IG_APP_UA))
+    _apply_cookies(mobile, cookies, minimal=True)
+    variants.append(("mobile-auth", mobile, True))
+    return variants
+
+
 def _relation_page_from_base(
     session: requests.Session,
     base: str,
@@ -457,11 +484,9 @@ def _relation_page_from_base(
     kind: str,
     max_id: str | None,
     deadline: float,
+    base_params: dict | None = None,
 ) -> tuple[list, str | None] | None:
-    params = {
-        "count": 100,
-        "search_surface": "follow_list_page",
-    }
+    params = dict(base_params or {"count": 100, "search_surface": "follow_list_page"})
     if max_id:
         params["max_id"] = max_id
 
@@ -471,9 +496,7 @@ def _relation_page_from_base(
         params,
         deadline,
     )
-    if status == 401:
-        return None
-    if status in (403, 404, 429):
+    if status in (401, 403, 404, 429):
         return None
     if status != 200 or not data or data.get("status") == "fail":
         return None
@@ -482,7 +505,9 @@ def _relation_page_from_base(
     if not isinstance(users, list):
         return None
     cursor = data.get("next_max_id")
-    return users, str(cursor) if cursor else None
+    if cursor in (None, ""):
+        cursor = data.get("next_cursor")
+    return users, str(cursor) if cursor not in (None, "") else None
 
 
 def _collect_pages(
@@ -498,63 +523,98 @@ def _collect_pages(
     if expected == 0:
         return []
 
-    # A host can return HTTP 200 with a truncated relationship list. Treat
-    # i.instagram.com and www.instagram.com as independent views and merge by
-    # immutable Instagram numeric ID rather than accepting the first 200.
+    # Instagram can return HTTP 200 with a relationship list that is shorter
+    # than the public profile counter. Different authenticated transports,
+    # hosts and pagination parameters can expose different slices. Merge all
+    # observed rows by immutable numeric ID and only accept the exact count.
     found: dict[str, dict] = {}
-    for base in RELATION_BASES:
-        max_id = None
-        seen_cursors: set[str] = set()
-        host_rows = 0
+    cookie_map = requests.utils.dict_from_cookiejar(session.cookies)
+    has_authenticated_session = bool(cookie_map.get("sessionid"))
+    transport_sessions = (
+        _relationship_sessions(session)
+        if has_authenticated_session
+        else [("primary-browser", session, False)]
+    )
+    relation_variants = (
+        RELATION_VARIANTS
+        if has_authenticated_session
+        else RELATION_VARIANTS[:1]
+    )
+    try:
+        for transport_name, candidate, _close_candidate in transport_sessions:
+            for variant_name, variant_params in relation_variants:
+                for base in RELATION_BASES:
+                    max_id = None
+                    seen_cursors: set[str] = set()
+                    host_rows = 0
 
-        while True:
-            _remaining(deadline)
-            page = _relation_page_from_base(
-                session,
-                base,
-                user_id,
-                kind,
-                max_id,
-                deadline,
-            )
-            if page is None:
-                break
-            users, cursor = page
-            host_rows += len(users)
-            for row in users:
-                member = _member(row)
-                found[member["id"]] = member
+                    while True:
+                        _remaining(deadline)
+                        page = _relation_page_from_base(
+                            candidate,
+                            base,
+                            user_id,
+                            kind,
+                            max_id,
+                            deadline,
+                            variant_params,
+                        )
+                        if page is None:
+                            break
+                        users, cursor = page
+                        host_rows += len(users)
+                        for row in users:
+                            member = _member(row)
+                            found[member["id"]] = member
 
-            if len(found) > expected:
-                raise HTTPException(409, f"{label}: список изменился во время проверки.")
-            if len(found) == expected:
-                logger.info(
-                    "Direct %s complete after relationship-host merge (%d/%d)",
-                    kind,
-                    len(found),
-                    expected,
-                )
-                return list(found.values())
+                        if len(found) > expected:
+                            raise HTTPException(
+                                409,
+                                f"{label}: список изменился во время проверки.",
+                            )
+                        if len(found) == expected:
+                            logger.info(
+                                "Direct %s complete after transport/variant merge "
+                                "(%s, %s, %d/%d)",
+                                kind,
+                                transport_name,
+                                variant_name,
+                                len(found),
+                                expected,
+                            )
+                            return list(found.values())
 
-            if not cursor:
-                break
-            if cursor in seen_cursors:
-                logger.warning("Direct %s pagination loop on one relationship host", kind)
-                break
-            seen_cursors.add(cursor)
-            max_id = cursor
+                        if not cursor:
+                            break
+                        if cursor in seen_cursors:
+                            logger.warning(
+                                "Direct %s pagination loop (%s, %s)",
+                                kind,
+                                transport_name,
+                                variant_name,
+                            )
+                            break
+                        seen_cursors.add(cursor)
+                        max_id = cursor
 
-        logger.info(
-            "Direct %s relationship host produced %d raw rows; combined %d/%d",
-            kind,
-            host_rows,
-            len(found),
-            expected,
-        )
+                    logger.info(
+                        "Direct %s slice %s/%s/%s produced %d raw rows; combined %d/%d",
+                        kind,
+                        transport_name,
+                        variant_name,
+                        base.split("//", 1)[-1].split("/", 1)[0],
+                        host_rows,
+                        len(found),
+                        expected,
+                    )
+    finally:
+        for _name, candidate, close_candidate in transport_sessions:
+            if close_candidate:
+                candidate.close()
 
     if len(found) != expected:
         logger.warning(
-            "Direct %s relationship incomplete after all hosts: %d/%d",
+            "Direct %s relationship incomplete after all transports/variants: %d/%d",
             kind,
             len(found),
             expected,
