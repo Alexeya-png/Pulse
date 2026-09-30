@@ -71,6 +71,8 @@ APIFY_RELATION_ATTEMPTS = max(1, min(5, int(os.environ.get("APIFY_RELATION_ATTEM
 APIFY_SESSION_ATTEMPTS = max(1, min(2, int(os.environ.get("APIFY_SESSION_ATTEMPTS", "1"))))
 APIFY_RETRY_DELAY = max(0.0, float(os.environ.get("APIFY_RETRY_DELAY", "2.0")))
 COLLECTION_TIMEOUT = max(30, min(180, int(os.environ.get("COLLECTION_TIMEOUT", "180"))))
+IG_RELAY_URL = os.environ.get("IG_RELAY_URL", "").strip().rstrip("/")
+IG_RELAY_TOKEN = os.environ.get("IG_RELAY_TOKEN", "").strip()
 TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"}
 _collect_lock = threading.Lock()
 _collection_state = threading.local()
@@ -1272,6 +1274,82 @@ def _collect_profile_apify(target: str) -> dict:
     }
 
 
+def _collect_relay_snapshot(target: str) -> dict:
+    relay_url = os.environ.get("IG_RELAY_URL", IG_RELAY_URL).strip().rstrip("/")
+    relay_token = os.environ.get("IG_RELAY_TOKEN", IG_RELAY_TOKEN).strip()
+    raw_session = os.environ.get("IG_SESSION_JSON", "").strip()
+    if not relay_url or not relay_token or not raw_session:
+        raise HTTPException(503, "Региональный relay для Instagram не настроен.")
+
+    remaining = _remaining()
+    timeout_seconds = max(30, min(165, int(remaining) - 2))
+    try:
+        response = requests.post(
+            relay_url + "/v1/collect",
+            json={
+                "username": target,
+                "session_json": raw_session,
+                "timeout_seconds": timeout_seconds,
+            },
+            headers={
+                "Authorization": f"Bearer {relay_token}",
+                "Accept": "application/json",
+                "User-Agent": "PulseChecker/relay-client",
+            },
+            timeout=Timeout(
+                total=remaining,
+                connect=min(10, remaining),
+                read=min(170, remaining),
+            ),
+        )
+    except requests.RequestException:
+        raise HTTPException(502, "Региональный Instagram relay временно недоступен.") from None
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    if response.status_code != 200:
+        detail = None
+        if isinstance(payload, dict):
+            value = payload.get("detail")
+            if isinstance(value, str) and value:
+                detail = value
+        safe_status = response.status_code if response.status_code in {400, 403, 404, 409, 429, 502, 503, 504} else 502
+        raise HTTPException(
+            safe_status,
+            detail or "Региональный Instagram relay не смог получить полный снимок.",
+        )
+
+    if not isinstance(payload, dict) or payload.get("account") != target or payload.get("complete") is not True:
+        raise HTTPException(502, "Региональный relay вернул некорректный снимок.")
+
+    followers = payload.get("followers")
+    following = payload.get("following")
+    if not isinstance(followers, list) or not isinstance(following, list):
+        raise HTTPException(502, "Региональный relay вернул неполные списки.")
+
+    try:
+        followers_count = int(payload.get("followers_count"))
+        following_count = int(payload.get("following_count"))
+    except (TypeError, ValueError):
+        raise HTTPException(502, "Региональный relay вернул некорректные счётчики.") from None
+
+    if len(followers) != followers_count or len(following) != following_count:
+        raise HTTPException(409, "Региональный relay вернул неполный снимок. Снимок не сохранён.")
+
+    payload["source"] = "pulse-regional-relay"
+    logger.info(
+        "Regional relay complete snapshot collected (%d/%d followers, %d/%d following)",
+        len(followers),
+        followers_count,
+        len(following),
+        following_count,
+    )
+    return payload
+
+
 def _collect_profile(target: str) -> dict:
     try:
         return _collect_profile_apify(target)
@@ -1282,8 +1360,23 @@ def _collect_profile(target: str) -> dict:
             "Apify collector unavailable (%d); trying direct Instagram fallback",
             exc.status_code,
         )
-        deadline = time.monotonic() + _remaining()
+
+    deadline = time.monotonic() + _remaining()
+    try:
         return collect_direct_snapshot(target, deadline)
+    except HTTPException as direct_exc:
+        if direct_exc.status_code not in (403, 409, 429, 502, 503, 504):
+            raise
+        if not (
+            os.environ.get("IG_RELAY_URL", IG_RELAY_URL).strip()
+            and os.environ.get("IG_RELAY_TOKEN", IG_RELAY_TOKEN).strip()
+        ):
+            raise
+        logger.warning(
+            "Local direct Instagram fallback unavailable (%d); trying regional relay",
+            direct_exc.status_code,
+        )
+        return _collect_relay_snapshot(target)
 
 
 @app.get("/health")
