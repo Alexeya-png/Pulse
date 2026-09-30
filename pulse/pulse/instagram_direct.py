@@ -173,6 +173,8 @@ def _current_profile(
     candidates.extend([
         ("https://i.instagram.com/api/v1/accounts/current_user/", {"edit": "true"}),
         ("https://www.instagram.com/api/v1/accounts/current_user/", {"edit": "true"}),
+        ("https://www.instagram.com/api/v1/users/web_profile_info/", {"username": target}),
+        ("https://i.instagram.com/api/v1/users/web_profile_info/", {"username": target}),
     ])
 
     saw_auth_error = False
@@ -195,6 +197,10 @@ def _current_profile(
         if returned_username != target:
             raise InstagramDirectError(
                 f"В Pulse выполнен вход как @{returned_username}. Для точного списка войдите как @{target}."
+            )
+        if user_id and str(returned_id) != user_id:
+            raise InstagramDirectError(
+                f"Сессия Instagram принадлежит другому аккаунту. Войдите в Pulse как @{target}."
             )
         followers_count = _count(user, "follower_count", "edge_followed_by")
         following_count = _count(user, "following_count", "edge_follow")
@@ -233,7 +239,9 @@ def _relation_page(
     if cursor:
         params["max_id"] = cursor
     status, data = _json_get(session, f"{base}/{user_id}/{kind}/", params, deadline)
-    if status in (401, 403, 404, 429):
+    if status in (401, 403):
+        raise InstagramDirectError("Сессия Instagram истекла. Откройте настройки Pulse и войдите ещё раз.")
+    if status in (404, 429):
         return None
     if status != 200 or not isinstance(data, dict) or data.get("status") == "fail":
         return None

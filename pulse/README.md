@@ -1,109 +1,75 @@
-# Pulse — подписчики и лайки Instagram
+# Pulse 0.7.0 — direct Instagram collector
 
-Версия 0.2.0. Приложение на Python для Android 7+ / arm64: интерфейс Kivy, локальная база SQLite, собственный HTTP-клиент. Сервера и стороннего сервиса сбора данных нет. Зависимость от instagrapi удалена; requests используется только как библиотека HTTP.
+Pulse is a Kivy Android app that stores complete Instagram follower/following snapshots
+locally and compares them by stable numeric Instagram ID.
 
-**Статус: исходники прототипа. Логика проверена 52 автоматическими тестами, интерфейс — на компьютере. APK не собран, настоящий вход в Instagram и работа на телефоне пока не проверены.**
+## Architecture
 
-## Как работает проверка
+Normal collection no longer goes through Render, HikerAPI, Apify, or any scraper Actor:
 
-1. На Android откройте подключение Instagram. Внутри приложения появится настоящая страница Instagram в WebView. Пароль, код 2FA и подтверждения вводятся на этой странице. После входа нажмите «Готово — проверить подключение».
-2. Клиент проверит сессию и загрузит полные доступные списки подписчиков и подписок. Первая успешная проверка сохранит точку отсчёта; прошлые отписки она не восстановит.
-3. При следующем запуске или возвращении в приложение начнётся новая проверка. ID, которые были среди подписчиков и исчезли из нового полного списка, попадут во вкладку «Отписки». Между проверками выдерживается минимум 5 минут; ограничения Instagram увеличивают ожидание.
-4. «Не взаимно» показывает разность **подписки минус подписчики**. Этот список доступен уже после первой полной проверки. Он означает отсутствие взаимной подписки сейчас, а не отказ человека подписаться.
-5. По умолчанию события показаны за последнее успешное наблюдение соответствующего списка. Кнопка «Вся история» открывает предыдущие события. Неизменившийся список при следующем наблюдении не создаёт повторных отписок.
+Android phone -> Instagram -> Pulse local SQLite.
 
-Сравнение идёт по ID: смена ника подписчика не считается отпиской. Невзаимные подписки вычисляются только из пары списков одного наблюдения. Если один из них загрузился не полностью, оба предыдущих списка сохраняются. Время обнаружения — интервал между проверками; точное время действия неизвестно.
+On the first collection Pulse opens an embedded Instagram WebView. Sign in to the same
+Instagram account whose username is entered in Pulse and press **Готово**. Pulse keeps
+only the required session cookies and the WebView user agent in the app's private storage.
+Android backup is disabled for the app.
 
-В настройках есть проверка лайков для 0 / 6 / 12 / 24 публикаций из начала ленты и периодическая проверка раз в 6 / 12 / 24 часа, пока приложение открыто. При открытии проверка запускается независимо от переключателя периодической проверки. Для подписчиков без лайков выберите 0 публикаций.
+The collector then:
 
-## Подключение и ограничения
+1. verifies the signed-in Instagram account against the target username and numeric ID;
+2. reads exact followers/following counters;
+3. paginates both relationship lists directly from Instagram;
+4. merges supported Instagram relationship hosts by numeric user ID;
+5. requires exact list lengths;
+6. rechecks the profile counters after the lists are loaded;
+7. creates a Snapshot only when every completeness check passes.
 
-**Собственный клиент не делает доступ официальным API Meta.** Код обращается напрямую к внутренним адресам сайта Instagram через сессию пользователя. Поддерживаемый API Meta не предоставляет необходимые полные списки подписчиков и поставивших лайк. Официальный OAuth сам по себе не решает эту задачу.
+If Instagram returns 109/110, 110/114, a rate limit, an expired session, or changing
+counts, Pulse does **not** save that result and therefore does not create false
+follow/unfollow events.
 
-- Instagram может отклонить вход во встроенном браузере, изменить адреса/формат ответа, скрыть часть списка или ограничить запросы. Реальная совместимость этого клиента ещё не подтверждена аккаунтом. При запросе подтверждения проверка останавливается; при ограничении частоты действует пауза 24 часа, сохраняемая между запусками. Обход подтверждений не реализован.
-- Полный список означает завершённую пагинацию и совпадение числа уникальных ID со счётчиками до и после загрузки. Недоступный, скрытый или неполный список не превращается в пустой. Это защищает от многих ложных отписок, но не обеспечивает атомарного снимка сервера: состав может измениться во время загрузки при том же числе людей.
-- Исчезновение ID может означать отписку, блокировку, удаление или деактивацию аккаунта. Приложение не определяет причину. Действия между двумя проверками, после которых список вернулся к прежнему составу, не обнаруживаются.
-- Лайки проверяются только для выбранных публикаций из начала ленты. Закреплённые посты влияют на выбор; посты, выпавшие из окна, перестают проверяться. Пропавшая публикация не означает массовое снятие лайков. Неполный список поставивших лайк пропускается.
-- Лимит — 250 запросов на один сбор. Большие списки могут не поместиться; при исчерпании лимита сбор отменяется без изменения базы. Один неизменившийся счётчик не позволяет пропустить чтение списка.
-- Фоновой службы и push-уведомлений нет. При сворачивании сбор отменяется; после возвращения запускается новая проверка с учётом пауз. Если завершение отменённого запроса ещё ожидается, доступна ручная проверка после его окончания.
-- История отслеживаемого профиля привязана к его имени. Если сам этот профиль переименован, новое имя начинает отдельную историю.
+## First use
 
-## Хранение данных
+1. Install the 0.7.0 APK.
+2. Enter your own Instagram username.
+3. Tap **Собрать данные**.
+4. In the embedded Instagram window, sign in to that same account.
+5. Tap **Готово**.
+6. Pulse automatically starts the first full collection.
 
-Python-код не получает пароль или код 2FA. После входа WebView передаёт клиенту cookies сессии. Клиент делает только запросы чтения к разрешённым адресам `https://www.instagram.com`, не следует перенаправлениям и не отправляет данные на внешний сервис.
+Later collections reuse the saved session. Use **Настройки -> Перевойти в Instagram**
+when Instagram expires the session, or **Забыть вход Instagram** to remove it from Pulse.
 
-На Android сессия шифруется AES-GCM с ключом Android Keystore; база наблюдений хранится в приватном каталоге приложения и отдельно не зашифрована. При закрытии окна входа выполняется очистка cookies, кеша и веб-хранилища WebView. Внезапное завершение процесса или ошибка Android могут помешать этой очистке; хранилище WebView также находится в каталоге приложения. Эти механизмы ещё требуют проверки на устройстве.
+## Local data
 
-Отключение аккаунта удаляет сохранённую сессию и оставляет историю. Для отзыва сессии на стороне Instagram используйте настройки безопасности Instagram. После перехода со старой версии подключения необходимо войти заново; прежняя история остаётся. Демо использует отдельную базу с вымышленными данными.
+Snapshots and comparison history are stored in the app-private SQLite database. The
+Instagram session is stored in the app-private preferences file and is not sent to the
+Pulse backend during normal collection. `android.allow_backup = False` and
+`android.private_storage = True` are enabled in `buildozer.spec`.
 
-## Запуск на компьютере
+The first complete snapshot is the baseline. Following snapshots show new followers,
+unfollowers, and non-reciprocal follows. Comparison is by numeric Instagram ID, so a
+username change alone is not treated as an unfollow.
 
-Нужен Python 3.11 или 3.12. Выполните из каталога проекта:
+## Backend
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe main.py --demo
-```
+`checker_backend` remains API-compatible as a direct-only diagnostic/fallback service.
+It no longer uses Apify/Hiker/public Actors. Because a cloud IP or checker session can see
+a truncated Instagram relationship list, the Android app does not depend on that service
+for normal collection.
 
-На Linux/macOS используйте `.venv/bin/python`. Без `--demo` открывается обычный экран. Вход через страницу Instagram реализован только для Android; настольная версия предназначена для проверки интерфейса и логики. Пароль и cookies вручную вводить в Pulse не нужно.
+## Build
 
-## Сборка APK
+GitHub Actions workflow: `.github/workflows/android.yml`.
 
-Подготовлены `buildozer.spec` и `.github/workflows/android.yml`. Workflow ещё не запускался, успешная сборка не подтверждена.
+It runs unit tests, builds the arm64 debug APK with Buildozer, verifies its signature, and
+uploads `pulse-android-debug` plus SHA256 checksums.
 
-**GitHub Actions:** поместите содержимое папки проекта в корень репозитория, откройте Actions → Android debug APK → Run workflow. После успешного выполнения артефакт `pulse-android-debug` будет содержать отладочный APK. Учётные данные Instagram для сборки не нужны.
-
-**Локально на Ubuntu 22.04 / WSL2:** работайте в Linux-файловой системе, не в `/mnt/c`.
-
-```bash
-sudo apt-get update
-sudo apt-get install -y git zip unzip openjdk-17-jdk python3-venv python3-pip \
-  autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
-  libtinfo5 cmake libffi-dev libssl-dev automake autopoint gettext
-python3 -m venv .venv-build
-source .venv-build/bin/activate
-python -m pip install buildozer==1.6.0 'Cython<3' setuptools wheel
-buildozer -v android debug
-```
-
-SDK/NDK и исходники зависимостей скачиваются при первой сборке. Результат появляется в `bin/`. Настройки проекта: Kivy 2.3.1, requests 2.34.2, python-for-android v2026.05.09, Android API 35, NDK 28c, arm64-v8a. Поддержка старых 32-битных устройств не настроена. Сборка и проверка этих версий на Android остаются обязательными перед выпуском.
-
-## Производительность и проверки
-
-- Сеть выполняется в одном рабочем потоке. Последовательные запросы разделены паузой 1,5 секунды, имеют таймауты подключения/чтения 10/20 секунд и не повторяются автоматически. Размер ответа ограничен 8 МиБ.
-- SQLite хранит текущие списки, наблюдения и изменения. Полная копия списка для каждого запуска не создаётся. Используются индексы, сравнение SQL и атомарная запись.
-- Неизменившийся полный список не переписывается: обновляются время и запись наблюдения. Для устойчивого хеша нужна сортировка: O(n log n), память O(n).
-- Интерфейс использует RecycleView и страницы по 80 записей с курсорами. Количество невзаимных подписок вычисляется по всей паре списков, независимо от страницы.
-
-Синтетический замер Windows / Python 3.12.14, **100 000 подписчиков и 7 500 подписок**: первая запись вместе с созданием объектов — 0,984 с; следующее сравнение — 0,702 с; страница истории — 4,72 мс; подсчёт невзаимных подписок и первая страница — 13,53 мс. База — 2,59 МиБ. Это один локальный замер без сети, не оценка скорости телефона.
+Local test command from `pulse/`:
 
 ```bash
 python -m unittest discover -s tests -v
-python tools/benchmark.py --members 100000
-python main.py --screenshot preview.png
 ```
 
-Пройдены 52 теста без обращений к Instagram и без пропусков тестов. Экраны демо, невзаимных подписок, лайков, фильтра истории, настроек, входа и справки проверены на компьютере. Подробности — `docs/VERIFICATION.md`; изображения — в `docs/`.
-
-## Файлы проекта
-
-| Файл | Назначение |
-|---|---|
-| `main.py`, `pulse/ui.py` | Запуск и интерфейс |
-| `pulse/android_login.py` | Вход на странице Instagram через Android WebView |
-| `pulse/client.py` | Собственный HTTP-клиент, сессия и обработка ответов |
-| `pulse/instagram.py` | Пагинация, сбор подписчиков/подписок/лайков и проверка полноты |
-| `pulse/store.py` | SQLite, сравнение, невзаимные подписки, история |
-| `pulse/model.py`, `pulse/errors.py` | Валидация и безопасные сообщения об ошибках |
-| `pulse/vault.py` | Шифрование сохранённой сессии |
-| `pulse/importer.py` | Дополнительный программный импорт JSON/ZIP подписчиков и лайков; в меню отсутствует |
-| `tests/`, `tools/benchmark.py` | Автоматические проверки и воспроизводимый замер |
-
-## Документация платформ
-
-- [Meta: Instagram API](https://www.postman.com/meta/instagram/documentation/6yqw8pt/instagram-api).
-- [Android WebView](https://developer.android.com/develop/ui/views/layout/webapps/webview) и [CookieManager](https://developer.android.com/reference/android/webkit/CookieManager).
-- [Android Keystore](https://developer.android.com/privacy-and-security/keystore).
-- [Kivy: упаковка для Android](https://kivy.org/doc/stable/guide/packaging-android.html).
-- [python-for-android v2026.05.09](https://github.com/kivy/python-for-android/releases/tag/v2026.05.09).
+Current Android configuration: Kivy 2.3.1, requests 2.34.2, API 35, min API 24,
+NDK 28c, arm64-v8a.
