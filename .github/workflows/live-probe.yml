@@ -40,3 +40,5 @@ jobs:
               print("HTTP_STATUS", e.code)
               print("ERROR_BODY", body)
           PY
+
+# serialized-verification
