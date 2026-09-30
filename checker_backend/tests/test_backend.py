@@ -30,11 +30,15 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(self.client.post("/v1/collect", json={}).status_code, 422)
             collect.assert_not_called()
 
-    def test_android_payload_and_normalization(self):
+    def test_android_payload_and_normalization_without_visible_list_links(self):
         page = MagicMock()
         page.locator.return_value.inner_text.return_value = "Profile"
         users = [{"id": "member", "username": "member"}]
-        with patch.object(main, "_make_page") as make_page, patch.object(main, "_assert_logged_in"), patch.object(main, "_exact_count", return_value=1), patch.object(main, "_open_relation"), patch.object(main, "_scroll_relation", return_value=users):
+        profile = {"id": "123", "followers_count": 1, "following_count": 1}
+        with patch.object(main, "_make_page") as make_page, \
+                patch.object(main, "_assert_logged_in"), \
+                patch.object(main, "_resolve_profile", return_value=profile), \
+                patch.object(main, "_collect_relation", return_value=users) as collect_relation:
             make_page.return_value.__enter__.return_value = (MagicMock(), page)
             response = self.client.post("/v1/collect", json={"username": " @Example "})
         self.assertEqual(response.status_code, 200)
@@ -45,16 +49,64 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(payload["complete"])
         self.assertEqual(payload["followers"], users)
         self.assertEqual(payload["following_count"], 1)
+        self.assertEqual(collect_relation.call_count, 2)
 
     def test_unverified_or_incomplete_snapshots_are_rejected(self):
         page = MagicMock()
         page.locator.return_value.inner_text.return_value = "Profile"
-        for counts, lists in [([None, 0], [[], []]), ([1, 0], [[], []]), ([0, 1], [[], []])]:
-            with self.subTest(counts=counts), patch.object(main, "_make_page") as make_page, patch.object(main, "_assert_logged_in"), patch.object(main, "_exact_count", side_effect=counts), patch.object(main, "_open_relation"), patch.object(main, "_scroll_relation", side_effect=lists):
+
+        with self.subTest("counts unavailable"), \
+                patch.object(main, "_make_page") as make_page, \
+                patch.object(main, "_assert_logged_in"), \
+                patch.object(main, "_resolve_profile", return_value={"id": "123", "followers_count": None, "following_count": None}), \
+                patch.object(main, "_exact_count", return_value=None), \
+                patch.object(main, "_collect_relation") as relation:
+            make_page.return_value.__enter__.return_value = (MagicMock(), page)
+            response = self.client.post("/v1/collect", json={"username": "example"})
+            self.assertEqual(response.status_code, 409)
+            relation.assert_not_called()
+
+        for counts, lists in [((1, 0), [[], []]), ((0, 1), [[], []])]:
+            with self.subTest(counts=counts), \
+                    patch.object(main, "_make_page") as make_page, \
+                    patch.object(main, "_assert_logged_in"), \
+                    patch.object(main, "_resolve_profile", return_value={"id": "123", "followers_count": counts[0], "following_count": counts[1]}), \
+                    patch.object(main, "_collect_relation", side_effect=lists):
                 make_page.return_value.__enter__.return_value = (MagicMock(), page)
                 response = self.client.post("/v1/collect", json={"username": "example"})
             self.assertEqual(response.status_code, 409)
             self.assertNotIn("followers", response.json())
+
+    def test_profile_resolution_falls_back_from_brittle_profile_endpoint(self):
+        page = MagicMock()
+        with patch.object(main, "_ig_json", side_effect=[
+            (400, {"message": "bad request"}),
+            (200, {"users": [{"user": {"username": "Example", "pk": "123"}}]}),
+        ]):
+            profile = main._resolve_profile(page, "example")
+        self.assertEqual(profile["id"], "123")
+        self.assertIsNone(profile["followers_count"])
+        self.assertIsNone(profile["following_count"])
+
+    def test_relation_pagination_deduplicates_usernames(self):
+        page = MagicMock()
+        with patch.object(main, "_relation_page", side_effect=[
+            ([{"username": "Alice"}, {"username": "Bob"}], "cursor-2"),
+            ([{"username": "alice"}, {"username": "Carol"}], ""),
+        ]):
+            users = main._collect_relation(page, "123", "followers", 3, "Подписчики")
+        self.assertEqual(users, [
+            {"id": "alice", "username": "alice"},
+            {"id": "bob", "username": "bob"},
+            {"id": "carol", "username": "carol"},
+        ])
+
+    def test_relation_api_403_is_preserved(self):
+        page = MagicMock()
+        with patch.object(main, "_ig_json", return_value=(403, {"message": "forbidden"})):
+            with self.assertRaises(HTTPException) as error:
+                main._relation_page(page, "123", "followers")
+        self.assertEqual(error.exception.status_code, 403)
 
     def test_concurrent_request_is_rejected_and_lock_is_released(self):
         entered, release = threading.Event(), threading.Event()
@@ -107,19 +159,14 @@ class ApiTests(unittest.TestCase):
 
 
 class BrowserIntegrationTests(unittest.TestCase):
-    def test_real_shell_reads_counts_and_lists(self):
+    def test_real_shell_reads_exact_profile_counts(self):
         with browser_session() as browser:
             page = browser.new_page()
             page.set_content('''<base href="https://www.instagram.com/">
                 <a href="/example/followers/"><span title="1,234">1.2k followers</span></a>
-                <a href="/example/following/">2 following</a>
-                <div role="dialog"><a href="https://www.instagram.com/Alice/">Alice</a>
-                <a href="https://www.instagram.com/Alice/">duplicate</a>
-                <a href="https://www.instagram.com/bob/">Bob</a></div>''')
+                <a href="/example/following/">2 following</a>''')
             self.assertEqual(main._exact_count(page, "example", "followers"), 1234)
             self.assertEqual(main._exact_count(page, "example", "following"), 2)
-            members = main._scroll_relation(page.locator('[role="dialog"]'), 2, "test")
-            self.assertEqual(members, [{"id": "alice", "username": "alice"}, {"id": "bob", "username": "bob"}])
         self.assertFalse(browser.is_connected())
 
     def test_browser_lifecycle_across_request_threads_and_failure(self):
@@ -132,7 +179,6 @@ class BrowserIntegrationTests(unittest.TestCase):
                     raise ValueError("collection failed")
             return browser.is_connected()
 
-        # Force distinct live threads, as FastAPI's request pool can do.
         with ThreadPoolExecutor(max_workers=1) as first, ThreadPoolExecutor(max_workers=1) as second:
             self.assertFalse(first.submit(collect, False).result(timeout=30))
             with self.assertRaises(ValueError):

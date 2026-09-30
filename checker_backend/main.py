@@ -9,6 +9,7 @@ import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -26,6 +27,7 @@ app = FastAPI(title="Pulse Checker", version="0.4.0", lifespan=lifespan)
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
+IG_WEB_APP_ID = "936619743392459"
 _collect_lock = threading.Lock()
 logger = logging.getLogger("uvicorn.error")
 
@@ -79,7 +81,6 @@ def _session_cookies() -> list[dict]:
 
 @contextmanager
 def _make_page():
-    # Validate the session before allocating a browser.
     cookies = _session_cookies()
     with browser_session() as browser:
         context = browser.new_context(
@@ -139,84 +140,179 @@ def _exact_count(page, target: str, kind: str) -> int | None:
     return int(digits) if digits else None
 
 
-def _open_relation(page, target: str, kind: str):
-    href = f"/{target}/{kind}/"
-    locator = page.locator(f'a[href="{href}"]').first
-    if locator.count() == 0:
+def _ig_json(page, url: str) -> tuple[int, dict | None]:
+    result = page.evaluate(
+        """async ({url, appId}) => {
+            const response = await fetch(url, {
+                method: 'GET',
+                credentials: 'include',
+                headers: {
+                    'X-IG-App-ID': appId,
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': '*/*'
+                }
+            });
+            let data = null;
+            try { data = await response.json(); } catch (_) {}
+            return {status: response.status, data};
+        }""",
+        {"url": url, "appId": IG_WEB_APP_ID},
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(503, "Instagram вернул неожиданный ответ.")
+    status = int(result.get("status") or 0)
+    data = result.get("data")
+    return status, data if isinstance(data, dict) else None
+
+
+def _count_from_profile(user: dict, kind: str) -> int | None:
+    if kind == "followers":
+        candidates = (
+            user.get("follower_count"),
+            (user.get("edge_followed_by") or {}).get("count")
+            if isinstance(user.get("edge_followed_by"), dict) else None,
+        )
+    else:
+        candidates = (
+            user.get("following_count"),
+            (user.get("edge_follow") or {}).get("count")
+            if isinstance(user.get("edge_follow"), dict) else None,
+        )
+    for value in candidates:
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _resolve_profile(page, target: str) -> dict:
+    profile_url = (
+        "https://www.instagram.com/api/v1/users/web_profile_info/"
+        f"?username={quote(target, safe='')}"
+    )
+    status, data = _ig_json(page, profile_url)
+    if status == 404:
+        raise HTTPException(404, "Instagram-аккаунт не найден.")
+
+    if status == 200 and data:
+        user = data.get("data", {}).get("user")
+        if isinstance(user, dict):
+            username = str(user.get("username") or "").lower()
+            user_id = user.get("id") or user.get("pk")
+            if username == target and user_id is not None:
+                return {
+                    "id": str(user_id),
+                    "followers_count": _count_from_profile(user, "followers"),
+                    "following_count": _count_from_profile(user, "following"),
+                }
+
+    search_url = (
+        "https://www.instagram.com/api/v1/web/search/topsearch/"
+        f"?context=blended&query={quote(target, safe='')}&include_reel=false"
+    )
+    search_status, search_data = _ig_json(page, search_url)
+    if search_status in (401, 403):
+        raise HTTPException(
+            503,
+            "Instagram не принял checker-сессию для чтения данных. Обновите IG_SESSION_JSON.",
+        )
+    if search_status == 429:
+        raise HTTPException(
+            503,
+            "Instagram временно ограничил запросы checker-аккаунта. Попробуйте позже.",
+        )
+    if search_status != 200 or not search_data:
+        raise HTTPException(
+            503,
+            f"Instagram не дал определить аккаунт для сбора (HTTP {search_status or 'unknown'}).",
+        )
+
+    for item in search_data.get("users") or []:
+        user = item.get("user") if isinstance(item, dict) else None
+        if not isinstance(user, dict):
+            continue
+        if str(user.get("username") or "").lower() != target:
+            continue
+        user_id = user.get("pk") or user.get("id")
+        if user_id is not None:
+            return {
+                "id": str(user_id),
+                "followers_count": _count_from_profile(user, "followers"),
+                "following_count": _count_from_profile(user, "following"),
+            }
+
+    raise HTTPException(404, "Instagram-аккаунт не найден.")
+
+
+def _relation_page(page, user_id: str, kind: str, max_id: str = "") -> tuple[list, str]:
+    url = (
+        f"https://www.instagram.com/api/v1/friendships/{quote(user_id, safe='')}/{kind}/"
+        "?count=50"
+    )
+    if max_id:
+        url += f"&max_id={quote(max_id, safe='')}"
+
+    status, data = _ig_json(page, url)
+    if status in (401,):
+        raise HTTPException(
+            503,
+            "IG_SESSION_JSON checker-аккаунта истёк или Instagram отклонил сессию.",
+        )
+    if status == 403:
         raise HTTPException(
             403,
-            "Instagram не показывает этот список checker-аккаунту.",
+            "Instagram не разрешил checker-аккаунту читать этот список.",
         )
-    locator.click()
-    dialog = page.locator('div[role="dialog"]').last
-    dialog.wait_for(state="visible", timeout=15000)
-    return dialog
+    if status == 429:
+        raise HTTPException(
+            503,
+            "Instagram временно ограничил запросы checker-аккаунта. Попробуйте позже.",
+        )
+    if status != 200 or not data:
+        raise HTTPException(
+            503,
+            f"Instagram не вернул список {kind} (HTTP {status or 'unknown'}).",
+        )
+    if data.get("status") == "fail":
+        raise HTTPException(503, f"Instagram отклонил получение списка {kind}.")
+
+    users = data.get("users")
+    if not isinstance(users, list):
+        raise HTTPException(503, f"Instagram вернул неверный формат списка {kind}.")
+    return users, str(data.get("next_max_id") or "")
 
 
-def _extract_usernames(dialog) -> dict[str, dict]:
-    rows = dialog.evaluate(
-        r"""dialog => {
-            const out = [];
-            for (const a of dialog.querySelectorAll('a[href]')) {
-                let path;
-                try { path = new URL(a.href).pathname; } catch (_) { continue; }
-                const m = path.match(/^\/([A-Za-z0-9._]{1,30})\/$/);
-                if (!m) continue;
-                const u = m[1].toLowerCase();
-                if (['accounts','explore','reels','direct'].includes(u)) continue;
-                out.push(u);
-            }
-            return [...new Set(out)];
-        }"""
-    )
-    return {u: {"id": u, "username": u} for u in rows if USERNAME_RE.fullmatch(u)}
+def _collect_relation(page, user_id: str, kind: str, expected: int | None, label: str) -> list[dict]:
+    if expected == 0:
+        return []
 
-
-def _scroll_relation(dialog, expected: int | None, label: str) -> list[dict]:
     found: dict[str, dict] = {}
-    stable_rounds = 0
-    last_count = -1
+    next_max_id = ""
+    seen_cursors: set[str] = set()
 
-    for _ in range(1200):
-        found.update(_extract_usernames(dialog))
+    for _ in range(10000):
+        users, cursor = _relation_page(page, user_id, kind, next_max_id)
+        for user in users:
+            if not isinstance(user, dict):
+                continue
+            username = str(user.get("username") or "").strip().lower()
+            if USERNAME_RE.fullmatch(username):
+                found[username] = {"id": username, "username": username}
+
         if len(found) > MAX_MEMBERS:
             raise HTTPException(413, f"{label}: список больше лимита сервера.")
-
         if expected is not None and len(found) >= expected:
             break
-
-        state = dialog.evaluate(
-            """dialog => {
-                const all = [dialog, ...dialog.querySelectorAll('*')];
-                const candidates = all.filter(
-                    e => e.scrollHeight > e.clientHeight + 20
-                );
-                candidates.sort((a,b) => (b.scrollHeight-b.clientHeight) - (a.scrollHeight-a.clientHeight));
-                const sc = candidates[0];
-                if (!sc) return {moved:false, end:true};
-                const before = sc.scrollTop;
-                sc.scrollTop = Math.min(
-                    sc.scrollHeight,
-                    sc.scrollTop + Math.max(500, sc.clientHeight * 0.85)
-                );
-                const end = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 8;
-                return {moved: sc.scrollTop !== before, end};
-            }"""
-        )
-
-        if len(found) == last_count:
-            stable_rounds += 1
-        else:
-            stable_rounds = 0
-            last_count = len(found)
-
-        if state.get("end") and stable_rounds >= 8:
+        if not cursor:
             break
-        if stable_rounds >= 18:
+        if cursor in seen_cursors:
             break
+        seen_cursors.add(cursor)
+        next_max_id = cursor
         time.sleep(0.35)
 
-    found.update(_extract_usernames(dialog))
     return list(found.values())
 
 
@@ -235,27 +331,28 @@ def _collect_profile(target: str) -> dict:
         if "sorry, this page isn't available" in body:
             raise HTTPException(404, "Instagram-аккаунт не найден.")
 
-        expected_followers = _exact_count(page, target, "followers")
-        expected_following = _exact_count(page, target, "following")
+        profile = _resolve_profile(page, target)
+        expected_followers = profile.get("followers_count")
+        expected_following = profile.get("following_count")
 
-        followers_dialog = _open_relation(page, target, "followers")
-        followers = _scroll_relation(
-            followers_dialog, expected_followers, "Подписчики"
-        )
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(500)
-
-        following_dialog = _open_relation(page, target, "following")
-        following = _scroll_relation(
-            following_dialog, expected_following, "Подписки"
-        )
-        page.keyboard.press("Escape")
+        if expected_followers is None:
+            expected_followers = _exact_count(page, target, "followers")
+        if expected_following is None:
+            expected_following = _exact_count(page, target, "following")
 
         if expected_followers is None or expected_following is None:
             raise HTTPException(
                 409,
                 "Не удалось подтвердить точное количество списков. Снимок не сохранён.",
             )
+
+        followers = _collect_relation(
+            page, profile["id"], "followers", expected_followers, "Подписчики"
+        )
+        following = _collect_relation(
+            page, profile["id"], "following", expected_following, "Подписки"
+        )
+
         if len(followers) != expected_followers:
             raise HTTPException(
                 409,
