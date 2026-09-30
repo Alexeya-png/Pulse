@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from urllib3.util import Timeout
 
-app = FastAPI(title="Pulse Checker", version="0.5.7")
+app = FastAPI(title="Pulse Checker", version="0.5.8")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -966,6 +966,16 @@ def _collect_relation(
             if attempt + 1 < APIFY_RELATION_ATTEMPTS and APIFY_RETRY_DELAY:
                 _pause(APIFY_RETRY_DELAY)
 
+    missing = expected - len(combined)
+    if is_following and expected >= 50 and missing == 1:
+        logger.warning(
+            "%s: Instagram exposes %d/%d following records; using the complete accessible list",
+            label,
+            len(combined),
+            expected,
+        )
+        return list(combined.values())
+
     raise HTTPException(
         409,
         f"{label}: получено {len(combined)} из {expected}. Снимок не сохранён.",
@@ -1024,11 +1034,14 @@ def _collect_profile(target: str) -> dict:
             409,
             "Списки изменились прямо во время проверки. Запустите сбор ещё раз.",
         )
-    if len(followers) != followers_count or len(following) != following_count:
-        raise HTTPException(409, "Получены неполные списки. Снимок не сохранён.")
+    following_gap = following_count - len(following)
+    if len(followers) != followers_count:
+        raise HTTPException(409, "Получен неполный список подписчиков. Снимок не сохранён.")
+    if following_gap not in (0, 1) or (following_gap == 1 and following_count < 50):
+        raise HTTPException(409, "Получен неполный список подписок. Снимок не сохранён.")
     _remaining()
     logger.info(
-        "Online complete snapshot collected (%d/%d followers, %d/%d following)",
+        "Online complete accessible snapshot collected (%d/%d followers, %d/%d following)",
         len(followers),
         after["followers_count"],
         len(following),
@@ -1039,10 +1052,12 @@ def _collect_profile(target: str) -> dict:
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "followers_count": len(followers),
         "following_count": len(following),
+        "reported_following_count": after["following_count"],
+        "following_accessible_gap": following_gap,
         "followers": followers,
         "following": following,
         "complete": True,
-        "source": "apify-online",
+        "source": "apify-online-accessible" if following_gap else "apify-online",
     }
 
 
