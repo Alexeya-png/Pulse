@@ -450,39 +450,39 @@ def _member(row: dict) -> dict:
     return {"id": str(user_id), "username": username}
 
 
-def _relation_page(
+def _relation_page_from_base(
     session: requests.Session,
+    base: str,
     user_id: str,
     kind: str,
     max_id: str | None,
     deadline: float,
-) -> tuple[list, str | None]:
-    params = {"count": 50}
+) -> tuple[list, str | None] | None:
+    params = {
+        "count": 100,
+        "search_surface": "follow_list_page",
+    }
     if max_id:
         params["max_id"] = max_id
-    saw_forbidden = False
-    for base in RELATION_BASES:
-        status, data = _json_get(
-            session,
-            f"{base}/{user_id}/{kind}/",
-            params,
-            deadline,
-        )
-        if status == 401:
-            raise HTTPException(503, "IG_SESSION_JSON checker-аккаунта истёк.")
-        if status == 403:
-            saw_forbidden = True
-            continue
-        if status != 200 or not data or data.get("status") == "fail":
-            continue
-        users = data.get("users")
-        if not isinstance(users, list):
-            raise HTTPException(503, f"{kind}: Instagram вернул неполную страницу.")
-        cursor = data.get("next_max_id")
-        return users, str(cursor) if cursor else None
-    if saw_forbidden:
-        raise HTTPException(403, "Instagram не разрешил checker-аккаунту читать этот список.")
-    raise HTTPException(503, f"Instagram не вернул список {kind}.")
+
+    status, data = _json_get(
+        session,
+        f"{base}/{user_id}/{kind}/",
+        params,
+        deadline,
+    )
+    if status == 401:
+        return None
+    if status in (403, 404, 429):
+        return None
+    if status != 200 or not data or data.get("status") == "fail":
+        return None
+
+    users = data.get("users")
+    if not isinstance(users, list):
+        return None
+    cursor = data.get("next_max_id")
+    return users, str(cursor) if cursor else None
 
 
 def _collect_pages(
@@ -498,25 +498,67 @@ def _collect_pages(
     if expected == 0:
         return []
 
+    # A host can return HTTP 200 with a truncated relationship list. Treat
+    # i.instagram.com and www.instagram.com as independent views and merge by
+    # immutable Instagram numeric ID rather than accepting the first 200.
     found: dict[str, dict] = {}
-    max_id = None
-    seen_cursors: set[str] = set()
-    while True:
-        _remaining(deadline)
-        users, cursor = _relation_page(session, user_id, kind, max_id, deadline)
-        for row in users:
-            member = _member(row)
-            found[member["id"]] = member
-        if len(found) > expected:
-            raise HTTPException(409, f"{label}: список изменился во время проверки.")
-        if not cursor:
-            break
-        if cursor in seen_cursors:
-            raise HTTPException(503, f"{label}: зациклилась пагинация.")
-        seen_cursors.add(cursor)
-        max_id = cursor
+    for base in RELATION_BASES:
+        max_id = None
+        seen_cursors: set[str] = set()
+        host_rows = 0
+
+        while True:
+            _remaining(deadline)
+            page = _relation_page_from_base(
+                session,
+                base,
+                user_id,
+                kind,
+                max_id,
+                deadline,
+            )
+            if page is None:
+                break
+            users, cursor = page
+            host_rows += len(users)
+            for row in users:
+                member = _member(row)
+                found[member["id"]] = member
+
+            if len(found) > expected:
+                raise HTTPException(409, f"{label}: список изменился во время проверки.")
+            if len(found) == expected:
+                logger.info(
+                    "Direct %s complete after relationship-host merge (%d/%d)",
+                    kind,
+                    len(found),
+                    expected,
+                )
+                return list(found.values())
+
+            if not cursor:
+                break
+            if cursor in seen_cursors:
+                logger.warning("Direct %s pagination loop on one relationship host", kind)
+                break
+            seen_cursors.add(cursor)
+            max_id = cursor
+
+        logger.info(
+            "Direct %s relationship host produced %d raw rows; combined %d/%d",
+            kind,
+            host_rows,
+            len(found),
+            expected,
+        )
 
     if len(found) != expected:
+        logger.warning(
+            "Direct %s relationship incomplete after all hosts: %d/%d",
+            kind,
+            len(found),
+            expected,
+        )
         raise HTTPException(
             409,
             f"{label}: получено {len(found)} из {expected}. Снимок не сохранён.",
