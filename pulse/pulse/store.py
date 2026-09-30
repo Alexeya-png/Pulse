@@ -135,8 +135,9 @@ class Store:
             streams = [dict(r) for r in db.execute("SELECT kind,subject,member_count,captured_at FROM streams WHERE account=?", (account,))]
             totals = {(r["kind"], r["direction"]): r["n"] for r in db.execute("SELECT kind,direction,COUNT(*) AS n FROM events WHERE account=? GROUP BY kind,direction", (account,))}
             latest_removed = db.execute("SELECT COUNT(*) FROM events e JOIN streams s ON s.id=e.stream_id WHERE e.account=? AND e.kind='followers' AND e.direction='removed' AND e.until=s.captured_at", (account,)).fetchone()[0]
+            latest_added = db.execute("SELECT COUNT(*) FROM events e JOIN streams s ON s.id=e.stream_id WHERE e.account=? AND e.kind='followers' AND e.direction='added' AND e.until=s.captured_at", (account,)).fetchone()[0]
         reciprocal = self.nonreciprocal(account, limit=1)
-        return {"followers": next((s["member_count"] for s in streams if s["kind"] == "followers"), None), "posts": sum(s["kind"] == "likes" for s in streams), "last_seen": max((s["captured_at"] for s in streams), default=None), "unfollowers": totals.get(("followers", "removed"), 0), "unlikes": totals.get(("likes", "removed"), 0), "new_followers": totals.get(("followers", "added"), 0), "latest_unfollowers": latest_removed, "nonreciprocal": reciprocal["total"]}
+        return {"followers": next((s["member_count"] for s in streams if s["kind"] == "followers"), None), "posts": sum(s["kind"] == "likes" for s in streams), "last_seen": max((s["captured_at"] for s in streams), default=None), "unfollowers": totals.get(("followers", "removed"), 0), "unlikes": totals.get(("likes", "removed"), 0), "new_followers": totals.get(("followers", "added"), 0), "latest_unfollowers": latest_removed, "latest_new_followers": latest_added, "nonreciprocal": reciprocal["total"]}
 
     def events(self, account: str, kind: str, direction: str, *, before: int | None = None, limit: int = 80, latest: bool = False) -> list[dict]:
         if kind not in {"followers", "likes"} or direction not in {"added", "removed"}:
