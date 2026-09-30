@@ -11,7 +11,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Pulse Checker", version="0.5.1")
+app = FastAPI(title="Pulse Checker", version="0.5.2")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -22,6 +22,10 @@ APIFY_PROFILE_ACTOR = os.environ.get(
 )
 APIFY_RELATION_ACTOR = os.environ.get(
     "APIFY_RELATION_ACTOR",
+    "scraping_solutions~instagram-scraper-followers-following",
+)
+APIFY_RELATION_FALLBACK_ACTOR = os.environ.get(
+    "APIFY_RELATION_FALLBACK_ACTOR",
     "scraping_solutions~instagram-scraper-followers-following-no-cookies",
 )
 APIFY_PAGE_SIZE = min(1000, max(1, int(os.environ.get("APIFY_PAGE_SIZE", "1000"))))
@@ -204,7 +208,6 @@ def _start_actor(actor: str, body: dict) -> dict:
         body=body,
         params={
             "timeout": APIFY_RUN_TIMEOUT,
-            "memory": 256,
         },
         timeout=(10, 45),
     )
@@ -302,36 +305,42 @@ def _member(row: dict, username: str, data_type: str) -> dict:
     return {"id": str(user_id), "username": member_username}
 
 
-def _collect_relation(
+def _collect_relation_from_actor(
+    actor: str,
+    min_limit: int,
+    extra_input: dict,
     username: str,
     expected: int,
     data_type: str,
     label: str,
 ) -> list[dict]:
-    if expected > MAX_MEMBERS:
-        raise HTTPException(413, f"{label}: список больше лимита сервера.")
-    if expected == 0:
-        return []
-
     found: dict[str, dict] = {}
     continuation: str | None = None
     seen_tokens: set[str] = set()
     max_runs = (expected // APIFY_PAGE_SIZE) + 3
 
     for _ in range(max_runs):
+        remaining = max(1, expected - len(found))
         body = {
             "Account": [username],
-            "resultsLimit": min(APIFY_PAGE_SIZE, max(1, expected - len(found))),
+            "resultsLimit": max(
+                min_limit,
+                min(APIFY_PAGE_SIZE, remaining),
+            ),
             "dataToScrape": data_type,
+            **extra_input,
         }
         if continuation:
             body["continuationToken"] = continuation
 
-        run = _start_actor(APIFY_RELATION_ACTOR, body)
+        run = _start_actor(actor, body)
         run = _wait_run(str(run["id"]))
         dataset_id = run.get("defaultDatasetId")
         if not dataset_id:
-            raise HTTPException(502, f"{label}: онлайн-collector не создал результат.")
+            raise HTTPException(
+                502,
+                f"{label}: онлайн-collector не создал результат.",
+            )
 
         rows = _dataset_items(str(dataset_id))
         for row in rows:
@@ -343,7 +352,16 @@ def _collect_relation(
                     f"{label}: список изменился во время проверки. Снимок не сохранён.",
                 )
 
-        continuation = _next_token(_run_output(str(run["id"])), username, data_type)
+        output = _run_output(str(run["id"]))
+        continuation = _next_token(output, username, data_type)
+        logger.info(
+            "Apify relation actor %s returned %d rows; total %d/%d; continuation=%s",
+            actor,
+            len(rows),
+            len(found),
+            expected,
+            bool(continuation),
+        )
 
         if not continuation:
             break
@@ -355,19 +373,84 @@ def _collect_relation(
         seen_tokens.add(continuation)
 
         if len(found) >= expected:
-            raise HTTPException(
-                409,
-                f"{label}: список изменился во время проверки. Снимок не сохранён.",
-            )
+            break
     else:
-        raise HTTPException(502, f"{label}: слишком много страниц. Снимок не сохранён.")
-
-    if len(found) != expected:
         raise HTTPException(
-            409,
-            f"{label}: получено {len(found)} из {expected}. Снимок не сохранён.",
+            502,
+            f"{label}: слишком много страниц. Снимок не сохранён.",
         )
+
     return list(found.values())
+
+
+def _collect_relation(
+    username: str,
+    expected: int,
+    data_type: str,
+    label: str,
+) -> list[dict]:
+    if expected > MAX_MEMBERS:
+        raise HTTPException(
+            413,
+            f"{label}: список больше лимита сервера.",
+        )
+    if expected == 0:
+        return []
+
+    providers = [
+        (
+            APIFY_RELATION_ACTOR,
+            50,
+            {"enrichProfileDetails": False},
+        ),
+        (
+            APIFY_RELATION_FALLBACK_ACTOR,
+            25,
+            {},
+        ),
+    ]
+    best: list[dict] = []
+    seen_actors: set[str] = set()
+
+    for actor, min_limit, extra_input in providers:
+        if not actor or actor in seen_actors:
+            continue
+        seen_actors.add(actor)
+        try:
+            result = _collect_relation_from_actor(
+                actor,
+                min_limit,
+                extra_input,
+                username,
+                expected,
+                data_type,
+                label,
+            )
+        except HTTPException as exc:
+            if exc.status_code in (401, 403, 429):
+                raise
+            logger.warning(
+                "Apify relation actor %s failed (%d); trying fallback",
+                actor,
+                exc.status_code,
+            )
+            continue
+
+        if len(result) == expected:
+            return result
+        if len(result) > len(best):
+            best = result
+        logger.warning(
+            "Apify relation actor %s returned %d/%d; trying fallback",
+            actor,
+            len(result),
+            expected,
+        )
+
+    raise HTTPException(
+        409,
+        f"{label}: получено {len(best)} из {expected}. Снимок не сохранён.",
+    )
 
 
 def _collect_profile(target: str) -> dict:
@@ -396,7 +479,7 @@ def _collect_profile(target: str) -> dict:
     following = _collect_relation(
         target,
         following_count,
-        "Following",
+        "Followings",
         "Подписки",
     )
 
