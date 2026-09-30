@@ -1,0 +1,37 @@
+name: Temporary kh.alexeya smoke test
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/smoke-kh.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 8
+    steps:
+      - name: Call Pulse backend
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+
+          url = "https://pulse-checker-702b.onrender.com/v1/collect"
+          body = json.dumps({"username":"kh.alexeya"}).encode("utf-8")
+          req = Request(url, data=body, headers={"Content-Type":"application/json","Accept":"application/json","User-Agent":"Pulse-Smoke/1.0"}, method="POST")
+          try:
+              with urlopen(req, timeout=300) as r:
+                  data = r.read().decode("utf-8")
+                  print("STATUS", r.status)
+                  print(data[:12000])
+          except HTTPError as e:
+              data = e.read().decode("utf-8", "replace")
+              print("STATUS", e.code)
+              print(data[:12000])
+              raise
+          PY
