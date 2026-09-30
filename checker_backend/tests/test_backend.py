@@ -150,7 +150,8 @@ class ApiTests(unittest.TestCase):
                 {"id": "2", "username": "bob"},
             ]
 
-        with patch.object(main, "_collect_relation_from_actor", side_effect=collect):
+        with patch.object(main, "_collect_relation_from_actor", side_effect=collect), \
+                patch.object(main, "APIFY_RELATION_ATTEMPTS", 1):
             result = main._collect_relation(
                 "example",
                 2,
@@ -163,6 +164,88 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(calls[1][3], "Followings")
         self.assertEqual(calls[0][1], 50)
         self.assertEqual(calls[1][1], 25)
+
+    def test_relation_retries_merge_unique_ids(self):
+        attempts = [
+            [
+                {"id": "1", "username": "alice"},
+                {"id": "2", "username": "bob"},
+            ],
+            [
+                {"id": "2", "username": "bob"},
+                {"id": "3", "username": "carol"},
+            ],
+        ]
+
+        with patch.object(
+            main,
+            "_collect_relation_from_actor",
+            side_effect=attempts,
+        ), patch.object(
+            main,
+            "APIFY_RELATION_ATTEMPTS",
+            2,
+        ), patch.object(
+            main,
+            "APIFY_RETRY_DELAY",
+            0,
+        ):
+            result = main._collect_relation(
+                "example",
+                3,
+                "Followers",
+                "Подписчики",
+            )
+
+        self.assertEqual(
+            {item["id"] for item in result},
+            {"1", "2", "3"},
+        )
+
+    def test_relation_accepts_exactly_one_hidden_record_for_large_list(self):
+        exposed = [
+            {"id": str(i), "username": f"user{i}"}
+            for i in range(1, 110)
+        ]
+        with patch.object(
+            main,
+            "_collect_relation_from_actor",
+            return_value=exposed,
+        ), patch.object(
+            main,
+            "APIFY_RELATION_ATTEMPTS",
+            1,
+        ):
+            result = main._collect_relation(
+                "example",
+                110,
+                "Followings",
+                "Подписки",
+            )
+        self.assertEqual(len(result), 109)
+
+    def test_relation_rejects_two_hidden_records(self):
+        exposed = [
+            {"id": str(i), "username": f"user{i}"}
+            for i in range(1, 109)
+        ]
+        with patch.object(
+            main,
+            "_collect_relation_from_actor",
+            return_value=exposed,
+        ), patch.object(
+            main,
+            "APIFY_RELATION_ATTEMPTS",
+            1,
+        ):
+            with self.assertRaises(HTTPException) as error:
+                main._collect_relation(
+                    "example",
+                    110,
+                    "Followings",
+                    "Подписки",
+                )
+        self.assertEqual(error.exception.status_code, 409)
 
     def test_collect_profile_requests_followings_plural(self):
         profile = {
