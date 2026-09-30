@@ -13,27 +13,31 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
-      - name: Inspect actor input schema endpoints
+      - name: Inspect fallback actor metadata
         run: |
           python - <<'PY'
           import json
           from urllib.request import urlopen
           from urllib.error import HTTPError
 
-          urls = [
-            "https://api.apify.com/v2/actor-builds/3hrzbUnfzJoeNpQoo",
-            "https://api.apify.com/v2/actor-builds/3hrzbUnfzJoeNpQoo/input-schema",
-            "https://api.apify.com/v2/acts/scraping_solutions~instagram-scraper-followers-following-no-cookies/builds/latest",
-            "https://api.apify.com/v2/acts/scraping_solutions~instagram-scraper-followers-following-no-cookies/versions/0.0/input-schema",
-          ]
-          for url in urls:
-              print("\nURL", url)
-              try:
-                  with urlopen(url, timeout=30) as r:
-                      raw = r.read().decode("utf-8", "replace")
-                  print(raw[:50000])
-              except HTTPError as e:
-                  print("HTTP", e.code, e.read().decode("utf-8", "replace")[:3000])
-              except Exception as e:
-                  print(type(e).__name__, str(e))
+          actor = "scraping_solutions~instagram-scraper-followers-following"
+          base = f"https://api.apify.com/v2/acts/{actor}"
+          with urlopen(base, timeout=30) as r:
+              meta = json.load(r)["data"]
+          print("ACTOR", json.dumps({
+              "id": meta.get("id"),
+              "title": meta.get("title"),
+              "description": meta.get("description"),
+              "latest": meta.get("taggedBuilds", {}).get("latest"),
+              "pricingInfos": meta.get("pricingInfos"),
+              "readmeSummary": meta.get("readmeSummary"),
+          }, ensure_ascii=False))
+
+          build_id = meta.get("taggedBuilds", {}).get("latest", {}).get("buildId")
+          if not build_id:
+              raise SystemExit("No latest build")
+          with urlopen(f"https://api.apify.com/v2/actor-builds/{build_id}", timeout=30) as r:
+              build = json.load(r)["data"]
+          print("INPUT_SCHEMA", build.get("inputSchema"))
+          print("README", (build.get("readme") or "")[:40000])
           PY
