@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -10,7 +11,8 @@ import instaloader
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Pulse Checker", version="0.1.0")
+app = FastAPI(title="Pulse Checker", version="0.1.1")
+logger = logging.getLogger("pulse.checker")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -79,8 +81,34 @@ def _make_loader() -> instaloader.Instaloader:
         ) from None
     except instaloader.exceptions.BadCredentialsException:
         raise HTTPException(503, "Неверные данные проверяющего Instagram-аккаунта.") from None
-    except instaloader.exceptions.InstaloaderException:
-        raise HTTPException(503, "Instagram не разрешил войти проверяющему аккаунту.") from None
+    except instaloader.exceptions.InstaloaderException as exc:
+        message = str(exc or "")
+        safe_message = message.replace(password, "***") if password else message
+        logger.warning(
+            "Instagram checker login failed: %s: %s",
+            exc.__class__.__name__,
+            safe_message[:500],
+        )
+        lower = message.lower()
+        if "checkpoint" in lower or "challenge" in lower:
+            raise HTTPException(
+                503,
+                "Instagram запросил подтверждение входа/checkpoint. Откройте checker-аккаунт в Instagram, подтвердите вход и затем повторите проверку. Если повторяется — используйте IG_SESSION_JSON.",
+            ) from None
+        if "two-factor" in lower or "2fa" in lower:
+            raise HTTPException(
+                503,
+                "Instagram требует 2FA. Для этого аккаунта нужен IG_SESSION_JSON.",
+            ) from None
+        if "login" in lower and ("required" in lower or "please wait" in lower):
+            raise HTTPException(
+                503,
+                "Instagram временно не принимает серверный вход. Подтвердите вход в самом Instagram и попробуйте снова.",
+            ) from None
+        raise HTTPException(
+            503,
+            "Instagram отклонил серверный вход. Для стабильной работы нужен IG_SESSION_JSON, созданный после обычного входа в аккаунт.",
+        ) from None
     except (ValueError, TypeError, json.JSONDecodeError):
         raise HTTPException(503, "IG_SESSION_JSON имеет неверный формат.") from None
 
@@ -143,6 +171,8 @@ def health():
     return {
         "ok": True,
         "checker_configured": bool(os.environ.get("IG_CHECKER_USERNAME")),
+        "has_password": bool(os.environ.get("IG_CHECKER_PASSWORD")),
+        "has_session": bool(os.environ.get("IG_SESSION_JSON")),
     }
 
 
