@@ -20,9 +20,8 @@ jobs:
           from urllib.request import urlopen
 
           actors = [
-              "apify~instagram-followers-following-scraper",
-              "coderx~instagram-followers-following-scraper-no-cookies-login",
-              "dami_studio~instagram-followers-following-scraper",
+              "publicsignallabs~instagram-following",
+              "thenetaji~instagram-followers-followings-scraper",
           ]
           for actor in actors:
               print("\n=== ACTOR", actor, "===")
