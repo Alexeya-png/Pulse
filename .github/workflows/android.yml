@@ -39,6 +39,8 @@ jobs:
         working-directory: pulse
         run: |
           python -m pip install -r requirements.txt
+          python -m py_compile pulse/checker_client.py
+          python -m py_compile ../checker_backend/main.py
           python -m unittest discover -s tests -v
 
       - name: Build APK
