@@ -138,20 +138,98 @@ class ApiTests(unittest.TestCase):
             )
         self.assertEqual(result, [{"id": "1", "username": "alice"}])
 
-    def test_relation_wrapper_uses_followings_and_fallback(self):
-        calls = []
+    def test_checker_sessionid_accepts_flat_and_nested_json(self):
+        with patch.dict(
+            os.environ,
+            {"IG_SESSION_JSON": '{"sessionid":"flat-secret"}'},
+        ):
+            self.assertEqual(main._checker_sessionid(), "flat-secret")
+        with patch.dict(
+            os.environ,
+            {"IG_SESSION_JSON": '{"cookies":{"sessionid":"nested-secret"}}'},
+        ):
+            self.assertEqual(main._checker_sessionid(), "nested-secret")
 
-        def collect(actor, min_limit, extra_input, username, expected, data_type, label):
-            calls.append((actor, min_limit, extra_input, data_type))
-            if len(calls) == 1:
-                return []
-            return [
-                {"id": "1", "username": "alice"},
-                {"id": "2", "username": "bob"},
-            ]
+    def test_session_actor_following_uses_checker_session(self):
+        run = {"id": "r1", "defaultDatasetId": "d1"}
+        rows = [{
+            "ok": True,
+            "recordType": "relationship_profile",
+            "id": "1",
+            "username": "Alice",
+            "sourceUsername": "example",
+            "listType": "following",
+        }]
+        captured = {}
 
-        with patch.object(main, "_collect_relation_from_actor", side_effect=collect), \
-                patch.object(main, "APIFY_RELATION_ATTEMPTS", 1):
+        def start(actor, body):
+            captured["actor"] = actor
+            captured["body"] = body
+            return run
+
+        with patch.object(main, "_start_actor", side_effect=start), \
+                patch.object(main, "_wait_run", return_value=run), \
+                patch.object(main, "_dataset_items", return_value=rows), \
+                patch.object(main, "_checker_sessionid", return_value="server-secret"):
+            result = main._collect_session_actor(
+                "example",
+                1,
+                "Followings",
+                "Подписки",
+            )
+
+        self.assertEqual(result, [{"id": "1", "username": "alice"}])
+        self.assertEqual(captured["body"]["listType"], "following")
+        self.assertEqual(captured["body"]["sessionCookies"], ["server-secret"])
+        self.assertTrue(captured["body"]["proxyConfiguration"]["useApifyProxy"])
+
+    def test_session_actor_followers_does_not_send_checker_session(self):
+        run = {"id": "r1", "defaultDatasetId": "d1"}
+        rows = [{
+            "ok": True,
+            "recordType": "relationship_profile",
+            "id": "1",
+            "username": "Alice",
+            "sourceUsername": "example",
+            "listType": "followers",
+        }]
+        captured = {}
+
+        def start(actor, body):
+            captured["body"] = body
+            return run
+
+        with patch.object(main, "_start_actor", side_effect=start), \
+                patch.object(main, "_wait_run", return_value=run), \
+                patch.object(main, "_dataset_items", return_value=rows), \
+                patch.object(main, "_checker_sessionid", return_value="server-secret"):
+            result = main._collect_session_actor(
+                "example",
+                1,
+                "Followers",
+                "Подписчики",
+            )
+
+        self.assertEqual(result, [{"id": "1", "username": "alice"}])
+        self.assertNotIn("sessionCookies", captured["body"])
+
+    def test_relation_wrapper_uses_session_provider_first(self):
+        session_rows = [
+            {"id": "1", "username": "alice"},
+            {"id": "2", "username": "bob"},
+        ]
+        with patch.object(
+            main,
+            "_collect_session_actor",
+            return_value=session_rows,
+        ) as session_collect, patch.object(
+            main,
+            "_collect_relation_from_actor",
+        ) as fallback_collect, patch.object(
+            main,
+            "APIFY_RELATION_ATTEMPTS",
+            1,
+        ):
             result = main._collect_relation(
                 "example",
                 2,
@@ -160,10 +238,14 @@ class ApiTests(unittest.TestCase):
             )
 
         self.assertEqual(len(result), 2)
-        self.assertEqual(calls[0][3], "Followings")
-        self.assertEqual(calls[1][3], "Followings")
-        self.assertEqual(calls[0][1], 50)
-        self.assertEqual(calls[1][1], 25)
+        session_collect.assert_called_once_with(
+            "example",
+            2,
+            "Followings",
+            "Подписки",
+        )
+        fallback_collect.assert_not_called()
+
 
     def test_relation_retries_merge_unique_ids(self):
         attempts = [
@@ -178,6 +260,10 @@ class ApiTests(unittest.TestCase):
         ]
 
         with patch.object(
+            main,
+            "_collect_session_actor",
+            return_value=[],
+        ), patch.object(
             main,
             "_collect_relation_from_actor",
             side_effect=attempts,
@@ -209,6 +295,10 @@ class ApiTests(unittest.TestCase):
         ]
         with patch.object(
             main,
+            "_collect_session_actor",
+            return_value=[],
+        ), patch.object(
+            main,
             "_collect_relation_from_actor",
             return_value=exposed,
         ), patch.object(
@@ -230,6 +320,10 @@ class ApiTests(unittest.TestCase):
             for i in range(1, 109)
         ]
         with patch.object(
+            main,
+            "_collect_session_actor",
+            return_value=[],
+        ), patch.object(
             main,
             "_collect_relation_from_actor",
             return_value=exposed,
