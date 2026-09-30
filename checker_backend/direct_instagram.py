@@ -37,10 +37,6 @@ RELATION_BASES = (
 )
 RELATION_VARIANTS = (
     ("surface-100", {"count": 100, "search_surface": "follow_list_page"}),
-    ("plain-100", {"count": 100}),
-    ("surface-50", {"count": 50, "search_surface": "follow_list_page"}),
-    ("plain-50", {"count": 50}),
-    ("plain-200", {"count": 200}),
 )
 _pace_lock = threading.Lock()
 _last_request_at = 0.0
@@ -517,6 +513,8 @@ def _collect_pages(
     expected: int,
     label: str,
     deadline: float,
+    *,
+    allow_partial: bool = False,
 ) -> list[dict]:
     if expected > MAX_MEMBERS:
         raise HTTPException(413, f"{label}: список больше лимита сервера.")
@@ -619,6 +617,8 @@ def _collect_pages(
             len(found),
             expected,
         )
+        if allow_partial:
+            return list(found.values())
         raise HTTPException(
             409,
             f"{label}: получено {len(found)} из {expected}. Снимок не сохранён.",
@@ -645,11 +645,22 @@ def collect_direct_snapshot(
         )
 
         following = _collect_pages(
-            session, user_id, "following", following_count, "Подписки", deadline
+            session,
+            user_id,
+            "following",
+            following_count,
+            "Подписки",
+            deadline,
+            allow_partial=True,
         )
+        following_complete = len(following) == following_count
+
+        # Followers drive follow/unfollow history and remain strict. Never
+        # accept a partial follower list because that could create false events.
         followers = _collect_pages(
             session, user_id, "followers", followers_count, "Подписчики", deadline
         )
+        followers_complete = len(followers) == followers_count
 
         after = _profile(session, target, deadline)
         if after["id"] != user_id:
@@ -659,11 +670,11 @@ def collect_direct_snapshot(
             or after["following_count"] != following_count
         ):
             raise HTTPException(409, "Списки изменились прямо во время проверки.")
-        if len(followers) != followers_count or len(following) != following_count:
-            raise HTTPException(409, "Получены неполные списки. Снимок не сохранён.")
+        if not followers_complete:
+            raise HTTPException(409, "Получен неполный список подписчиков. Снимок не сохранён.")
 
         logger.info(
-            "Direct Instagram complete snapshot collected (%d/%d followers, %d/%d following)",
+            "Direct Instagram snapshot collected (%d/%d followers, %d/%d following)",
             len(followers),
             followers_count,
             len(following),
@@ -676,6 +687,12 @@ def collect_direct_snapshot(
             "following_count": following_count,
             "followers": followers,
             "following": following,
-            "complete": True,
-            "source": "pulse-direct-server",
+            "followers_complete": followers_complete,
+            "following_complete": following_complete,
+            "complete": followers_complete and following_complete,
+            "source": (
+                "pulse-direct-server"
+                if following_complete
+                else "pulse-direct-server-following-partial"
+            ),
         }
