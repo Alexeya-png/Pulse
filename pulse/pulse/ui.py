@@ -177,7 +177,7 @@ class PulseApp(App):
         top.add_widget(self.mode_label)
         root.add_widget(top)
         root.add_widget(label("Что изменилось?", size=27, height=40, bold=True))
-        root.add_widget(label("Подписчики и лайки · история наблюдений", size=12, color=MUTED, height=20))
+        root.add_widget(label("История подписчиков", size=12, color=MUTED, height=20))
         target_row = BoxLayout(size_hint_y=None, height=dp(47), spacing=dp(8))
         self.target = field("Аккаунт для проверки", "demo_account" if self.demo_mode else self.prefs.get("target", ""))
         self.target.bind(on_text_validate=lambda *_: self.refresh())
@@ -202,7 +202,7 @@ class PulseApp(App):
         root.add_widget(self.status)
         tabs = BoxLayout(size_hint_y=None, height=dp(37), spacing=dp(6))
         self.tabs = []
-        for text, filt in (("Отписки", ("followers", "removed")), ("Не взаимно", ("nonreciprocal", "current")), ("Лайки", ("likes", "removed")), ("Новые", ("followers", "added"))):
+        for text, filt in (("Отписки", ("followers", "removed")), ("Не взаимно", ("nonreciprocal", "current")), ("Новые", ("followers", "added"))):
             button = Pill(text=text, on_release=lambda _, f=filt: self.set_filter(f))
             tabs.add_widget(button)
             self.tabs.append((button, filt))
@@ -255,8 +255,8 @@ class PulseApp(App):
         names = ["anna.visual", "max.travels", "dasha.film", "ilya.design", "maria.sea", "alex.notes", "kate.studio", "nikita.jpg"]
         people = tuple(Member(name, str(i + 100)) for i, name in enumerate(names))
         following = people[:6] + (Member("studio.north", "950"),)
-        self.store.ingest(Snapshot("demo_account", "2026-09-27T09:00:00Z", (Sample("followers", "", people, "id"), Sample("following", "", following, "id"), Sample("likes", "384729105", people[:4], "id"))))
-        self.store.ingest(Snapshot("demo_account", "2026-09-29T10:30:00Z", (Sample("followers", "", people[3:] + (Member("sofia.art", "900"),), "id"), Sample("following", "", following, "id"), Sample("likes", "384729105", people[2:4], "id"))))
+        self.store.ingest(Snapshot("demo_account", "2026-09-27T09:00:00Z", (Sample("followers", "", people, "id"), Sample("following", "", following, "id"))))
+        self.store.ingest(Snapshot("demo_account", "2026-09-29T10:30:00Z", (Sample("followers", "", people[3:] + (Member("sofia.art", "900"),), "id"), Sample("following", "", following, "id"))))
 
     def message(self, text):
         if not self.stopping:
@@ -351,7 +351,7 @@ class PulseApp(App):
         self.message("Загружаем полные списки…")
 
         def work():
-            result = InstagramReader(self.client, self.cancel, self.progress).collect(target, recent_posts=self.prefs.get("posts", 12))
+            result = InstagramReader(self.client, self.cancel, self.progress).collect(target)
             if self.cancel.is_set():
                 raise SyncError("Проверка отменена.", "cancelled")
             # Persist the session before committing observations, avoiding a half-success message.
@@ -410,7 +410,7 @@ class PulseApp(App):
         if reciprocal_view:
             self.rv.data = [{"title": "@" + row["username"], "detail": "Вы подписаны, ответной подписки нет\nПроверено: " + short_date(reciprocal["captured_at"]), "badge": "·", "tint": PINK} for row in self.visible_rows]
         else:
-            self.rv.data = [{"title": "@" + row["username"], "detail": f"{short_date(row['since'])} - {short_date(row['until'])}" + (f"\nПубликация {row['subject']}" if row["kind"] == "likes" else "\nМежду двумя проверками"), "badge": "+" if row["direction"] == "added" else "−", "tint": LIME if row["direction"] == "added" else PINK} for row in self.visible_rows]
+            self.rv.data = [{"title": "@" + row["username"], "detail": f"{short_date(row['since'])} - {short_date(row['until'])}\nМежду двумя проверками", "badge": "+" if row["direction"] == "added" else "−", "tint": LIME if row["direction"] == "added" else PINK} for row in self.visible_rows]
         if not self.rv.data:
             title, detail = "Пока нет изменений", "Изменения определяются по двум полным проверкам."
             if reciprocal_view:
@@ -484,7 +484,8 @@ class PulseApp(App):
                 self.web_login = None
                 if self.login_popup:
                     self.login_button.disabled = False
-                    self.login_message.text = "Не удалось открыть страницу входа. Проверьте, что Android System WebView установлен и включён."
+                    self.login_message.height = dp(50)
+                    self.login_message.text = "Не удалось открыть вход Instagram. Попробуйте ещё раз."
 
             def received(settings):
                 self.web_login = None
@@ -526,7 +527,7 @@ class PulseApp(App):
                 failed()
 
         self.login_button.bind(on_release=start_login)
-        self.login_popup = self.modal("Подключение Instagram", [self.login_message, self.login_button], height=330)
+        self.login_popup = self.modal("Подключение Instagram", [self.login_message, self.login_button], height=220)
         self.login_popup.bind(on_dismiss=lambda *_: setattr(self, "login_popup", None))
 
     def settings_dialog(self):
@@ -536,10 +537,10 @@ class PulseApp(App):
         save = Pill(text="Сохранить", fill=LIME, color=BG, size_hint_y=None, height=dp(43))
         demo = Pill(text="Выйти из демо" if self.demo_mode else "Посмотреть демо", size_hint_y=None, height=dp(43))
         logout = Pill(text="Отключить аккаунт", size_hint_y=None, height=dp(43))
-        popup = self.modal("Настройки проверки", [label("Автопроверка при открытом приложении", size=12), auto, label("Интервал в часах", size=12), hours, label("Публикаций из начала ленты (0 = без лайков)", size=12), posts, save, demo, logout], height=580)
+        popup = self.modal("Настройки проверки", [label("Автопроверка при открытом приложении", size=12), auto, label("Интервал в часах", size=12), hours, save, demo, logout], height=500)
 
         def apply(_):
-            self.prefs.update(auto=auto.text == "Включена", hours=int(hours.text), posts=int(posts.text), next_sync=time.time() + int(hours.text) * 3600)
+            self.prefs.update(auto=auto.text == "Включена", hours=int(hours.text), next_sync=time.time() + int(hours.text) * 3600)
             self.save_prefs()
             popup.dismiss()
             self.message("Настройки сохранены. Автопроверка работает, пока приложение открыто.")
@@ -576,7 +577,7 @@ class PulseApp(App):
         logout.bind(on_release=disconnect)
 
     def help_dialog(self):
-        self.dialog("Как работает Pulse", "1. Войдите на странице Instagram. Приложение сохранит полные списки подписчиков и подписок.\n\n2. При следующем открытии оно загрузит их снова. В разделе «Отписки» появятся люди, которых больше нет среди подписчиков. Первая проверка — точка отсчёта.\n\n3. «Не взаимно» — аккаунты, на которые вы подписаны, но которые не подписаны на вас. Этот список доступен уже после первой полной проверки.\n\nПолный список обязателен: при обрыве загрузки старые данные сохраняются. Между проверками — минимум 5 минут; ограничения Instagram могут увеличить ожидание.\n\nИсчезновение также может означать блокировку или удаление аккаунта. Точная причина неизвестна.\n\nЛайки проверяются для выбранных публикаций из начала ленты. Скрытые или неполные списки пропускаются.\n\nКлиент Pulse обращается напрямую к Instagram. Это не официальный API Meta. Фоновой службы после закрытия приложения нет.")
+        self.dialog("Как работает Pulse", "1. Подключите Instagram.\n\n2. Pulse сохранит списки подписчиков и подписок.\n\n3. При следующей проверке появятся отписки, новые и невзаимные подписки.\n\nПервая проверка — точка отсчёта. Между проверками — минимум 5 минут.")
 
     def on_pause(self):
         self.paused = True

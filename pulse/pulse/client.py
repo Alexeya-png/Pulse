@@ -1,7 +1,6 @@
 """Our direct, read-only Instagram web client. No Instagram SDK or proxy service.
 
-Uses the session created in this app's Android WebView. These endpoints belong
-to Instagram's website, not to Meta's supported third-party developer API.
+Uses the session created in the app's Android sign-in view.
 """
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ COOKIE_NAMES = {"sessionid", "csrftoken", "ds_user_id", "mid", "ig_did", "rur"}
 MAX_BODY = 8 * 1024 * 1024
 WEB_APP_ID = "936619743392459"
 # A strict endpoint allowlist prevents credentials being sent to arbitrary URLs.
-ENDPOINT = re.compile(r"(?:users/[a-z0-9_.]{1,30}/usernameinfo/|users/[0-9]{1,40}/info/|accounts/current_user/|friendships/[0-9]{1,40}/(?:followers|following)/|feed/user/[0-9]{1,40}/|media/[0-9]{1,40}/(?:info|likers)/)\Z")
+ENDPOINT = re.compile(r"(?:users/[a-z0-9_.]{1,30}/usernameinfo/|users/[0-9]{1,40}/info/|accounts/current_user/|friendships/[0-9]{1,40}/(?:followers|following)/)\Z")
 
 
 def parse_login_cookies(header: str) -> dict[str, str]:
