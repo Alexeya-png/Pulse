@@ -5,12 +5,11 @@ package.domain = app.localtracker
 source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json,java
 source.exclude_dirs = tests,tools,.git,.github,.venv,__pycache__,docs,bin
-version = 0.4.1
+version = 0.5.0
 requirements = python3,kivy==2.3.1,sqlite3,pyjnius
 orientation = portrait
 fullscreen = 0
-android.add_src = android_src
-android.add_activities = app.localtracker.pulse.PulseImportActivity
+android.permissions = INTERNET
 android.api = 35
 android.minapi = 24
 android.ndk = 28c
