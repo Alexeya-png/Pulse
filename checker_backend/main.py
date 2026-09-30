@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -11,7 +12,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Pulse Checker", version="0.5.3")
+app = FastAPI(title="Pulse Checker", version="0.5.4")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -27,6 +28,10 @@ APIFY_RELATION_ACTOR = os.environ.get(
 APIFY_RELATION_FALLBACK_ACTOR = os.environ.get(
     "APIFY_RELATION_FALLBACK_ACTOR",
     "scraping_solutions~instagram-scraper-followers-following-no-cookies",
+)
+APIFY_SESSION_ACTOR = os.environ.get(
+    "APIFY_SESSION_ACTOR",
+    "dami_studio~instagram-followers-following-scraper",
 )
 APIFY_PAGE_SIZE = min(1000, max(1, int(os.environ.get("APIFY_PAGE_SIZE", "1000"))))
 APIFY_POLL_SECONDS = max(0.2, float(os.environ.get("APIFY_POLL_SECONDS", "1.5")))
@@ -57,6 +62,23 @@ def _api_token() -> str:
             "Онлайн-collector ещё не настроен: добавьте APIFY_TOKEN в Render.",
         )
     return token
+
+
+def _checker_sessionid() -> str | None:
+    raw = os.environ.get("IG_SESSION_JSON", "").strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("sessionid")
+    if value is None and isinstance(payload.get("cookies"), dict):
+        value = payload["cookies"].get("sessionid")
+    value = str(value or "").strip()
+    return value or None
 
 
 def _request_json(
@@ -307,6 +329,80 @@ def _member(row: dict, username: str, data_type: str) -> dict:
     return {"id": str(user_id), "username": member_username}
 
 
+def _collect_session_actor(
+    username: str,
+    expected: int,
+    data_type: str,
+    label: str,
+) -> list[dict]:
+    if expected > 1000:
+        return []
+
+    list_type = "followers" if data_type == "Followers" else "following"
+    body = {
+        "profiles": [username],
+        "listType": list_type,
+        "maxItemsPerProfile": expected,
+        "requestTimeoutSeconds": 30,
+        "maxRunSeconds": 180,
+        "maxAttempts": 12,
+        "proxyConfiguration": {"useApifyProxy": True},
+    }
+    sessionid = _checker_sessionid()
+    if list_type == "following":
+        if not sessionid:
+            logger.warning(
+                "%s: checker session is unavailable for authenticated following provider",
+                label,
+            )
+            return []
+        body["sessionCookies"] = [sessionid]
+
+    run = _start_actor(APIFY_SESSION_ACTOR, body)
+    run = _wait_run(str(run["id"]))
+    dataset_id = run.get("defaultDatasetId")
+    if not dataset_id:
+        raise HTTPException(
+            502,
+            f"{label}: session-provider не создал результат.",
+        )
+
+    rows = _dataset_items(str(dataset_id))
+    found: dict[str, dict] = {}
+    diagnostic_codes: list[str] = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("recordType") == "relationship_profile":
+            source = str(row.get("sourceUsername") or "").strip().lower()
+            row_type = str(row.get("listType") or "").strip().lower()
+            if source and source != username:
+                continue
+            if row_type and row_type != list_type:
+                continue
+            member = _member(row, username, data_type)
+            found[member["id"]] = member
+            continue
+        if row.get("ok") is False:
+            code = str(row.get("code") or "UNKNOWN")[:64]
+            diagnostic_codes.append(code)
+
+    if diagnostic_codes:
+        logger.warning(
+            "Apify session actor diagnostics for %s: %s",
+            label,
+            ",".join(sorted(set(diagnostic_codes))),
+        )
+    logger.info(
+        "Apify session actor returned %d/%d for %s",
+        len(found),
+        expected,
+        label,
+    )
+    return list(found.values())
+
+
 def _collect_relation_from_actor(
     actor: str,
     min_limit: int,
@@ -399,6 +495,47 @@ def _collect_relation(
     if expected == 0:
         return []
 
+    combined: dict[str, dict] = {}
+
+    if APIFY_SESSION_ACTOR and expected <= 1000:
+        for attempt in range(APIFY_RELATION_ATTEMPTS):
+            try:
+                result = _collect_session_actor(
+                    username,
+                    expected,
+                    data_type,
+                    label,
+                )
+            except HTTPException as exc:
+                if exc.status_code in (401, 403, 429):
+                    raise
+                logger.warning(
+                    "Apify session actor attempt %d failed (%d)",
+                    attempt + 1,
+                    exc.status_code,
+                )
+                result = []
+
+            for member in result:
+                combined[member["id"]] = member
+            if len(combined) > expected:
+                raise HTTPException(
+                    409,
+                    f"{label}: данные изменились во время повторного сбора. Снимок не сохранён.",
+                )
+            if len(combined) == expected:
+                return list(combined.values())
+
+            logger.warning(
+                "Apify session actor attempt %d produced %d rows; combined %d/%d",
+                attempt + 1,
+                len(result),
+                len(combined),
+                expected,
+            )
+            if attempt + 1 < APIFY_RELATION_ATTEMPTS and APIFY_RETRY_DELAY:
+                time.sleep(APIFY_RETRY_DELAY)
+
     providers = [
         (
             APIFY_RELATION_ACTOR,
@@ -411,7 +548,6 @@ def _collect_relation(
             {},
         ),
     ]
-    combined: dict[str, dict] = {}
     seen_actors: set[str] = set()
 
     for actor, min_limit, extra_input in providers:
