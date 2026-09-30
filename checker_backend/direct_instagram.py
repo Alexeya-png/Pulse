@@ -47,8 +47,12 @@ def _remaining(deadline: float) -> float:
     return value
 
 
-def _session_data() -> dict[str, str]:
-    raw = os.environ.get("IG_SESSION_JSON", "").strip()
+def _session_data(raw_session_json: str | None = None) -> dict[str, str]:
+    raw = (
+        str(raw_session_json).strip()
+        if raw_session_json is not None
+        else os.environ.get("IG_SESSION_JSON", "").strip()
+    )
     if not raw:
         raise HTTPException(503, "Для прямого fallback нужен IG_SESSION_JSON checker-аккаунта.")
     try:
@@ -110,8 +114,8 @@ def _apply_cookies(
         session.headers["X-CSRFToken"] = csrf
 
 
-def _make_session() -> requests.Session:
-    data = _session_data()
+def _make_session(raw_session_json: str | None = None) -> requests.Session:
+    data = _session_data(raw_session_json)
     session = requests.Session()
     session.headers.update(_session_headers(IG_BROWSER_UA))
     _apply_cookies(session, data)
@@ -446,8 +450,12 @@ def _collect_pages(
     return list(found.values())
 
 
-def collect_direct_snapshot(target: str, deadline: float) -> dict:
-    with _make_session() as session:
+def collect_direct_snapshot(
+    target: str,
+    deadline: float,
+    session_json: str | None = None,
+) -> dict:
+    with _make_session(session_json) as session:
         before = _profile(session, target, deadline)
         if before["is_private"]:
             raise HTTPException(403, "Онлайн-режим поддерживает только публичные Instagram-аккаунты.")
