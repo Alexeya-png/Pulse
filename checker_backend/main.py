@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from urllib3.util import Timeout
 
-app = FastAPI(title="Pulse Checker", version="0.5.8")
+app = FastAPI(title="Pulse Checker", version="0.5.9")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -54,6 +54,14 @@ APIFY_OFFICIAL_RELATION_ACTOR = os.environ.get(
 APIFY_CODERX_RELATION_ACTOR = os.environ.get(
     "APIFY_CODERX_RELATION_ACTOR",
     "coderx~instagram-followers-following-scraper-no-cookies-login",
+)
+APIFY_DANEK_RELATION_ACTOR = os.environ.get(
+    "APIFY_DANEK_RELATION_ACTOR",
+    "danek~instagram-followers-following-scraper",
+)
+APIFY_SCRAPESMITH_RELATION_ACTOR = os.environ.get(
+    "APIFY_SCRAPESMITH_RELATION_ACTOR",
+    "scrapesmith~instagram-followers-following-scraper",
 )
 APIFY_PAGE_SIZE = min(1000, max(1, int(os.environ.get("APIFY_PAGE_SIZE", "1000"))))
 APIFY_POLL_SECONDS = max(0.2, float(os.environ.get("APIFY_POLL_SECONDS", "1.5")))
@@ -736,6 +744,92 @@ def _collect_coderx_actor(
     return list(found.values())
 
 
+def _collect_danek_actor(
+    username: str,
+    expected: int,
+    data_type: str,
+    label: str,
+) -> list[dict]:
+    if not APIFY_DANEK_RELATION_ACTOR:
+        return []
+
+    list_type = "followers" if data_type.strip().lower() in {"follower", "followers"} else "following"
+    run = _start_actor(
+        APIFY_DANEK_RELATION_ACTOR,
+        {
+            "usernames": [username],
+            "maxResultsPerUser": expected,
+            "dataToScrape": list_type,
+        },
+    )
+    run = _wait_run(str(run["id"]))
+    dataset_id = run.get("defaultDatasetId")
+    if not dataset_id:
+        raise HTTPException(502, f"{label}: независимый collector не создал результат.")
+
+    found: dict[str, dict] = {}
+    rows = _dataset_items(str(dataset_id))
+    for row in rows:
+        member = _member(row, username, data_type)
+        found[member["id"]] = member
+        if len(found) > expected:
+            raise HTTPException(
+                409,
+                f"{label}: список изменился во время проверки. Снимок не сохранён.",
+            )
+
+    logger.info(
+        "Apify danek fallback returned %d/%d for %s",
+        len(found),
+        expected,
+        label,
+    )
+    return list(found.values())
+
+
+def _collect_scrapesmith_actor(
+    username: str,
+    expected: int,
+    data_type: str,
+    label: str,
+) -> list[dict]:
+    if not APIFY_SCRAPESMITH_RELATION_ACTOR:
+        return []
+
+    list_type = "followers" if data_type.strip().lower() in {"follower", "followers"} else "following"
+    run = _start_actor(
+        APIFY_SCRAPESMITH_RELATION_ACTOR,
+        {
+            "usernames": [username],
+            "maxFollowers": expected,
+            "mode": list_type,
+        },
+    )
+    run = _wait_run(str(run["id"]))
+    dataset_id = run.get("defaultDatasetId")
+    if not dataset_id:
+        raise HTTPException(502, f"{label}: резервный collector не создал результат.")
+
+    found: dict[str, dict] = {}
+    rows = _dataset_items(str(dataset_id))
+    for row in rows:
+        member = _member(row, username, data_type)
+        found[member["id"]] = member
+        if len(found) > expected:
+            raise HTTPException(
+                409,
+                f"{label}: список изменился во время проверки. Снимок не сохранён.",
+            )
+
+    logger.info(
+        "Apify scrapesmith fallback returned %d/%d for %s",
+        len(found),
+        expected,
+        label,
+    )
+    return list(found.values())
+
+
 def _collect_relation_from_actor(
     actor: str,
     min_limit: int,
@@ -1024,9 +1118,16 @@ def _collect_relation(
             if attempt + 1 < APIFY_RELATION_ATTEMPTS and APIFY_RETRY_DELAY:
                 _pause(APIFY_RETRY_DELAY)
 
-    if APIFY_CODERX_RELATION_ACTOR and len(combined) < expected:
+    final_fallbacks = [
+        ("danek", APIFY_DANEK_RELATION_ACTOR, _collect_danek_actor),
+        ("coderx", APIFY_CODERX_RELATION_ACTOR, _collect_coderx_actor),
+        ("scrapesmith", APIFY_SCRAPESMITH_RELATION_ACTOR, _collect_scrapesmith_actor),
+    ]
+    for provider_name, actor, collector in final_fallbacks:
+        if not actor or len(combined) >= expected:
+            continue
         try:
-            result = _collect_coderx_actor(
+            result = collector(
                 username,
                 expected,
                 data_type,
@@ -1036,7 +1137,8 @@ def _collect_relation(
             if isinstance(exc, CollectionTimeout) or exc.status_code in (401, 403, 409, 429):
                 raise
             logger.warning(
-                "Apify independent no-cookie actor failed for %s (%d)",
+                "Apify %s fallback failed for %s (%d)",
+                provider_name,
                 label,
                 exc.status_code,
             )
@@ -1053,7 +1155,8 @@ def _collect_relation(
             return list(combined.values())
 
         logger.warning(
-            "Apify independent no-cookie actor produced %d rows; combined %d/%d",
+            "Apify %s fallback produced %d rows; combined %d/%d",
+            provider_name,
             len(result),
             len(combined),
             expected,

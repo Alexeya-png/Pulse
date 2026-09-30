@@ -311,6 +311,72 @@ class ApiTests(unittest.TestCase):
         })
 
 
+    def test_danek_actor_uses_independent_schema(self):
+        run = {"id": "r1", "defaultDatasetId": "d1"}
+        rows = [{
+            "sourceUsername": "example",
+            "userId": "1",
+            "username": "Alice",
+            "type": "following",
+        }]
+        captured = {}
+
+        def start(actor, body):
+            captured["actor"] = actor
+            captured["body"] = body
+            return run
+
+        with patch.object(main, "_start_actor", side_effect=start), \
+                patch.object(main, "_wait_run", return_value=run), \
+                patch.object(main, "_dataset_items", return_value=rows):
+            result = main._collect_danek_actor(
+                "example",
+                110,
+                "Followings",
+                "Подписки",
+            )
+
+        self.assertEqual(result, [{"id": "1", "username": "alice"}])
+        self.assertEqual(captured["actor"], main.APIFY_DANEK_RELATION_ACTOR)
+        self.assertEqual(captured["body"], {
+            "usernames": ["example"],
+            "maxResultsPerUser": 110,
+            "dataToScrape": "following",
+        })
+
+    def test_scrapesmith_actor_uses_independent_schema(self):
+        run = {"id": "r1", "defaultDatasetId": "d1"}
+        rows = [{
+            "sourceUsername": "example",
+            "id": "1",
+            "username": "Alice",
+            "type": "following",
+        }]
+        captured = {}
+
+        def start(actor, body):
+            captured["actor"] = actor
+            captured["body"] = body
+            return run
+
+        with patch.object(main, "_start_actor", side_effect=start), \
+                patch.object(main, "_wait_run", return_value=run), \
+                patch.object(main, "_dataset_items", return_value=rows):
+            result = main._collect_scrapesmith_actor(
+                "example",
+                110,
+                "Followings",
+                "Подписки",
+            )
+
+        self.assertEqual(result, [{"id": "1", "username": "alice"}])
+        self.assertEqual(captured["actor"], main.APIFY_SCRAPESMITH_RELATION_ACTOR)
+        self.assertEqual(captured["body"], {
+            "usernames": ["example"],
+            "maxFollowers": 110,
+            "mode": "following",
+        })
+
     def test_coderx_actor_uses_independent_following_schema(self):
         run = {"id": "r1", "defaultDatasetId": "d1"}
         rows = [
@@ -492,6 +558,10 @@ class ApiTests(unittest.TestCase):
             return_value=exposed,
         ), patch.object(
             main,
+            "_collect_danek_actor",
+            return_value=[],
+        ), patch.object(
+            main,
             "_collect_coderx_actor",
             return_value=missing,
         ) as independent:
@@ -510,6 +580,52 @@ class ApiTests(unittest.TestCase):
             "Followings",
             "Подписки",
         )
+
+    def test_danek_fallback_can_complete_following_before_coderx(self):
+        exposed = [
+            {"id": str(i), "username": f"user{i}"}
+            for i in range(1, 110)
+        ]
+        missing = [{"id": "110", "username": "user110"}]
+
+        with patch.object(
+            main,
+            "_collect_full_following_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_free_following_actor",
+            return_value=exposed,
+        ), patch.object(
+            main,
+            "_collect_official_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_session_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_relation_from_actor",
+            return_value=exposed,
+        ), patch.object(
+            main,
+            "_collect_danek_actor",
+            return_value=missing,
+        ) as danek, patch.object(
+            main,
+            "_collect_coderx_actor",
+        ) as coderx:
+            result = main._collect_relation(
+                "example",
+                110,
+                "Followings",
+                "Подписки",
+            )
+
+        self.assertEqual(len(result), 110)
+        danek.assert_called_once_with("example", 110, "Followings", "Подписки")
+        coderx.assert_not_called()
 
     def test_relation_rejects_one_hidden_record_for_large_list(self):
         exposed = [
@@ -538,7 +654,15 @@ class ApiTests(unittest.TestCase):
             return_value=exposed,
         ), patch.object(
             main,
+            "_collect_danek_actor",
+            return_value=[],
+        ), patch.object(
+            main,
             "_collect_coderx_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_scrapesmith_actor",
             return_value=[],
         ):
             with self.assertRaises(HTTPException) as error:
@@ -577,7 +701,15 @@ class ApiTests(unittest.TestCase):
             return_value=exposed,
         ), patch.object(
             main,
+            "_collect_danek_actor",
+            return_value=[],
+        ), patch.object(
+            main,
             "_collect_coderx_actor",
+            return_value=[],
+        ), patch.object(
+            main,
+            "_collect_scrapesmith_actor",
             return_value=[],
         ):
             with self.assertRaises(HTTPException) as error:
