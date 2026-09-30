@@ -196,9 +196,9 @@ class PulseApp(App):
             stats.add_widget(card)
             self.stats.append(value)
         root.add_widget(stats)
-        self.sync_btn = Pill(text="Проверить сейчас", fill=LIME, color=BG, bold=True, size_hint_y=None, height=dp(48), on_release=lambda *_: self.sync())
+        self.sync_btn = Pill(text="Импортировать выгрузку", fill=LIME, color=BG, bold=True, size_hint_y=None, height=dp(48), on_release=lambda *_: self.import_export())
         root.add_widget(self.sync_btn)
-        self.status = label("Подключите аккаунт, чтобы начать наблюдение.", size=12, color=MUTED, height=54)
+        self.status = label("Импортируйте ZIP/JSON выгрузки Instagram.", size=12, color=MUTED, height=54)
         root.add_widget(self.status)
         tabs = BoxLayout(size_hint_y=None, height=dp(37), spacing=dp(6))
         self.tabs = []
@@ -227,7 +227,7 @@ class PulseApp(App):
         pager.add_widget(self.next_btn)
         root.add_widget(pager)
         footer = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(8))
-        self.connect_btn = Pill(text="Подключить аккаунт", on_release=lambda *_: self.login_dialog())
+        self.connect_btn = Pill(text="Импортировать данные", on_release=lambda *_: self.import_export())
         footer.add_widget(self.connect_btn)
         footer.add_widget(Pill(text="Как работает", on_release=lambda *_: self.help_dialog()))
         root.add_widget(footer)
@@ -269,9 +269,8 @@ class PulseApp(App):
         if self.busy:
             return
         self.busy = True
-        self.cancel.clear()
         self.target.disabled = self.settings_btn.disabled = self.connect_btn.disabled = True
-        self.sync_btn.text = "Отменить проверку"
+        self.sync_btn.disabled = True
         future = self.pool.submit(work)
 
         def complete(_):
@@ -279,105 +278,27 @@ class PulseApp(App):
                 return
             self.busy = False
             self.target.disabled = self.settings_btn.disabled = self.connect_btn.disabled = False
-            self.sync_btn.text = "Проверить сейчас"
+            self.sync_btn.disabled = False
             try:
                 value = future.result()
-            except Exception as exc:
-                error = safe_error(exc)
-                self.message(str(error))
-                if error.code in {"auth", "challenge"}:
-                    self.prefs["auto"] = False
-                if error.code == "rate_limit":
-                    self.prefs["retry_after"] = time.time() + 86400
-                self.save_prefs()
-                if self.login_popup:
-                    self.login_message.text = str(error)
-                    self.login_button.disabled = False
+            except DataError as exc:
+                self.message(str(exc))
+                return
+            except Exception:
+                self.message("Не удалось импортировать выгрузку.")
                 return
             done(value)
 
         future.add_done_callback(lambda _: Clock.schedule_once(complete))
 
     def restore_session(self):
-        def work():
-            settings = self.vault.load()
-            if settings:
-                client = make_client(cancel=self.cancel)
-                try:
-                    client.set_settings(settings)
-                    if time.time() >= self.prefs.get("retry_after", 0):
-                        client.verify_session()
-                    return client
-                except Exception:
-                    client.close()
-                    raise
-            return None
-
-        def done(client):
-            self.client = client
-            if client:
-                self.message("Сессия восстановлена. Можно запустить проверку.")
-                self.connect_btn.text = "Аккаунт подключён"
-                if not self.target.text:
-                    self.target.text = client.account
-                # Opening the app always requests a fresh comparison, independently
-                # of the optional six-hour foreground scheduler.
-                self.sync()
-        self.submit(work, done)
+        return
 
     def sync(self):
-        if self.busy:
-            self.cancel.set()
-            self.message("Отмена после текущего запроса…")
-            return
-        if self.demo_mode:
-            self.message("Демонстрационные данные. Подключите аккаунт для реальной проверки.")
-            return
-        if not self.client:
-            self.login_dialog()
-            return
-        try:
-            target = username(self.target.text)
-        except DataError as exc:
-            self.message(str(exc))
-            return
-        now = time.time()
-        wait_until = max(self.prefs.get("retry_after", 0), self.prefs.get("manual_after", 0))
-        if now < wait_until:
-            self.message(f"Следующая проверка доступна через {max(1, int((wait_until - now) / 60))} мин.")
-            return
-        self.prefs.update(target=target, manual_after=now + 300, next_sync=now + self.prefs.get("hours", 6) * 3600)
-        self.save_prefs()
-        self.message("Загружаем полные списки…")
-
-        def work():
-            result = InstagramReader(self.client, self.cancel, self.progress).collect(target)
-            if self.cancel.is_set():
-                raise SyncError("Проверка отменена.", "cancelled")
-            # Persist the session before committing observations, avoiding a half-success message.
-            self.vault.save(self.client.get_settings())
-            return self.store.ingest(result.snapshot), result.warnings
-
-        def done(result):
-            changes, warnings = result
-            self.cursor, self.page_stack = None, []
-            self.refresh()
-            if changes.baselines and not changes.compared:
-                text = "Точка отсчёта сохранена. Изменения появятся после следующей проверки."
-            else:
-                summary = self.store.summary(target)
-                text = f"Проверено. Отписок: {summary['latest_unfollowers']}. Без ответа: {summary['nonreciprocal'] if summary['nonreciprocal'] is not None else 'нет данных'}."
-            if warnings:
-                text += f" Пропущено списков: {len(warnings)}."
-                self.dialog("Не все списки доступны", "\n\n".join(warnings))
-            self.message(text)
-        self.submit(work, done)
+        self.import_export()
 
     def auto_tick(self, _):
-        if self.demo_mode or self.paused or self.busy or self.login_popup or self.target.focus or not self.client or not self.prefs.get("auto", False):
-            return
-        if time.time() >= max(self.prefs.get("next_sync", 0), self.prefs.get("retry_after", 0)):
-            self.sync()
+        return
 
     def refresh(self):
         if not hasattr(self, "rv"):
@@ -460,91 +381,78 @@ class PulseApp(App):
         content.bind(width=lambda w, width: setattr(w, "text_size", (width, None)))
         return self.modal(title, [content], height=430)
 
-    def login_dialog(self):
-        if self.busy or self.web_login:
+    def import_export(self):
+        if self.busy or self.file_picker:
             return
-        text = ("Откроется страница Instagram. Пароль и код 2FA вводятся там. После входа нажмите «Готово». Проверка использует прямое подключение к сайту Instagram.")
+        if self.demo_mode:
+            self.demo_mode = False
+            self.store = self.real_store
+            self.mode_label.text = "INSTAGRAM"
+        try:
+            account = username(self.target.text)
+        except DataError:
+            self.message("Сначала укажите имя аккаунта.")
+            self.target.focus = True
+            return
         if platform != "android":
-            text = "Вход через страницу Instagram доступен в Android-приложении. На компьютере можно проверить интерфейс в демо. Пароль или cookies в Pulse вводить не нужно."
-        self.login_message = label(text, size=12, color=MUTED, height=105)
-        self.login_button = Pill(text="Открыть Instagram", fill=LIME, color=BG, size_hint_y=None, height=dp(45), disabled=platform != "android")
+            self.message("Импорт файла доступен в Android-приложении.")
+            return
 
-        def start_login(_):
-            if self.web_login or self.busy:
-                return
-            self.login_button.disabled = True
+        self.target.disabled = self.settings_btn.disabled = self.connect_btn.disabled = True
+        self.sync_btn.disabled = True
+        self.message("Выберите ZIP или JSON выгрузки Instagram…")
 
-            def cancelled():
-                self.web_login = None
-                if self.login_popup:
-                    self.login_button.disabled = False
-                    self.login_message.text = "Вход отменён. Предыдущие данные сохранены."
+        def unlock():
+            self.file_picker = None
+            self.target.disabled = self.settings_btn.disabled = self.connect_btn.disabled = False
+            self.sync_btn.disabled = False
 
-            def failed():
-                self.web_login = None
-                if self.login_popup:
-                    self.login_button.disabled = False
-                    self.login_message.height = dp(50)
-                    self.login_message.text = "Не удалось открыть вход Instagram. Попробуйте ещё раз."
+        def cancelled():
+            unlock()
+            self.message("Импорт отменён.")
 
-            def received(settings):
-                self.web_login = None
-                self.login_message.text = "Проверяем сессию Instagram…"
+        def failed(message):
+            unlock()
+            self.message(message or "Не удалось открыть файл.")
 
-                def work():
-                    client = make_client(cancel=self.cancel)
-                    try:
-                        client.set_settings(settings)
-                        client.verify_session()
-                        self.vault.save(client.get_settings())
-                        return client
-                    except Exception:
-                        client.close()
-                        raise
+        def selected(path):
+            unlock()
+            captured_at = datetime.now(timezone.utc).isoformat()
 
-                def done(client):
-                    if self.client:
-                        self.client.close()
-                    self.client = client
-                    self.demo_mode = False
-                    self.store = self.real_store
-                    self.mode_label.text = "INSTAGRAM"
-                    self.target.text = client.account
-                    self.prefs.update(login=client.account, target=client.account)
-                    self.prefs.setdefault("auto", True)
-                    self.save_prefs()
-                    if self.login_popup:
-                        self.login_popup.dismiss()
-                    self.connect_btn.text = "Аккаунт подключён"
-                    self.refresh()
-                    self.sync()
-                self.submit(work, done)
+            def work():
+                snapshot = load_snapshot(path, account, captured_at, export_complete=True)
+                changes = self.store.ingest(snapshot)
+                return changes, {sample.kind for sample in snapshot.samples}
 
-            try:
-                from .android_login import open_instagram_login
-                self.web_login = open_instagram_login(received, cancelled, failed)
-            except Exception:
-                failed()
+            def done(result):
+                changes, kinds = result
+                self.prefs["target"] = account
+                self.save_prefs()
+                self.cursor, self.page_stack = None, []
+                self.refresh()
+                if changes.baselines and not changes.compared:
+                    text = "Точка отсчёта сохранена."
+                else:
+                    summary = self.store.summary(account)
+                    text = f"Импортировано. Отписок: {summary['latest_unfollowers']}."
+                if "following" not in kinds:
+                    text += " В выгрузке нет following.json — невзаимные подписки не обновлены."
+                self.message(text)
 
-        self.login_button.bind(on_release=start_login)
-        self.login_popup = self.modal("Подключение Instagram", [self.login_message, self.login_button], height=220)
-        self.login_popup.bind(on_dismiss=lambda *_: setattr(self, "login_popup", None))
+            self.submit(work, done)
+
+        try:
+            from .android_import import pick_instagram_export
+            self.file_picker = pick_instagram_export(selected, cancelled, failed)
+        except Exception:
+            failed("Не удалось открыть выбор файла.")
+
+    def login_dialog(self):
+        self.import_export()
 
     def settings_dialog(self):
-        auto = Spinner(text="Включена" if self.prefs.get("auto") else "Выключена", values=("Выключена", "Включена"), size_hint_y=None, height=dp(42))
-        hours = Spinner(text=str(self.prefs.get("hours", 6)), values=("6", "12", "24"), size_hint_y=None, height=dp(42))
-        posts = Spinner(text=str(self.prefs.get("posts", 12)), values=("0", "6", "12", "24"), size_hint_y=None, height=dp(42))
-        save = Pill(text="Сохранить", fill=LIME, color=BG, size_hint_y=None, height=dp(43))
         demo = Pill(text="Выйти из демо" if self.demo_mode else "Посмотреть демо", size_hint_y=None, height=dp(43))
-        logout = Pill(text="Отключить аккаунт", size_hint_y=None, height=dp(43))
-        popup = self.modal("Настройки проверки", [label("Автопроверка при открытом приложении", size=12), auto, label("Интервал в часах", size=12), hours, save, demo, logout], height=500)
-
-        def apply(_):
-            self.prefs.update(auto=auto.text == "Включена", hours=int(hours.text), next_sync=time.time() + int(hours.text) * 3600)
-            self.save_prefs()
-            popup.dismiss()
-            self.message("Настройки сохранены. Автопроверка работает, пока приложение открыто.")
-        save.bind(on_release=apply)
+        popup = self.modal("Настройки", [demo], height=170)
 
         def show_demo(_):
             self.demo_mode = not self.demo_mode
@@ -557,27 +465,14 @@ class PulseApp(App):
             self.cursor, self.page_stack = None, []
             popup.dismiss()
             self.refresh()
+
         demo.bind(on_release=show_demo)
 
-        def disconnect(_):
-            if self.client:
-                self.client.close()
-            self.client = None
-            self.vault.clear()
-            self.prefs["auto"] = False
-            self.save_prefs()
-            self.demo_mode = False
-            self.store = self.real_store
-            self.mode_label.text = "INSTAGRAM"
-            self.target.text = self.prefs.get("target", "")
-            self.connect_btn.text = "Подключить аккаунт"
-            popup.dismiss()
-            self.refresh()
-            self.message("Локальная сессия удалена. История сохранена.")
-        logout.bind(on_release=disconnect)
-
     def help_dialog(self):
-        self.dialog("Как работает Pulse", "1. Подключите Instagram.\n\n2. Pulse сохранит списки подписчиков и подписок.\n\n3. При следующей проверке появятся отписки, новые и невзаимные подписки.\n\nПервая проверка — точка отсчёта. Между проверками — минимум 5 минут.")
+        self.dialog(
+            "Как работает Pulse",
+            "Импортируйте ZIP или JSON из выгрузки Instagram. Первый импорт — точка отсчёта. Следующий импорт покажет отписки, новые и невзаимные подписки."
+        )
 
     def on_pause(self):
         self.paused = True
@@ -586,12 +481,8 @@ class PulseApp(App):
 
     def on_resume(self):
         self.paused = False
-        if self.client and not self.demo_mode and not self.busy and not self.login_popup:
-            self.sync()
 
     def on_stop(self):
         self.stopping = True
-        if self.web_login:
-            self.web_login.close()
-        self.cancel.set()
         self.pool.shutdown(wait=False, cancel_futures=True)
+
