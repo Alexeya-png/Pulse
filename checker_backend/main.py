@@ -319,7 +319,16 @@ def _member(row: dict, username: str, data_type: str) -> dict:
         raise HTTPException(502, "Онлайн-collector смешал данные разных аккаунтов.")
 
     row_type = str(row.get("type") or row.get("listType") or "").strip().lower()
-    if row_type and row_type != data_type.lower():
+    expected_type = data_type.strip().lower()
+    if expected_type in {"following", "followings"}:
+        expected_type = "following"
+    elif expected_type in {"follower", "followers"}:
+        expected_type = "followers"
+    if row_type in {"following", "followings"}:
+        row_type = "following"
+    elif row_type in {"follower", "followers"}:
+        row_type = "followers"
+    if row_type and row_type != expected_type:
         raise HTTPException(502, "Онлайн-collector смешал followers и following.")
 
     user_id = row.get("id") or row.get("userId")
