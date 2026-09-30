@@ -11,7 +11,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Pulse Checker", version="0.5.0")
+app = FastAPI(title="Pulse Checker", version="0.5.1")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -71,7 +71,7 @@ def _request_json(
             headers={
                 "Authorization": f"Bearer {_api_token()}",
                 "Accept": "application/json",
-                "User-Agent": "PulseChecker/0.5",
+                "User-Agent": "PulseChecker/0.5.1",
             },
             timeout=timeout,
         )
@@ -104,6 +104,23 @@ def _request_json(
             "Онлайн-сервис Instagram-данных временно недоступен.",
         )
     if response.status_code >= 400:
+        try:
+            payload = response.json()
+            provider_message = (
+                payload.get("error", {}).get("message")
+                if isinstance(payload, dict) and isinstance(payload.get("error"), dict)
+                else None
+            )
+        except ValueError:
+            provider_message = None
+        if provider_message:
+            logger.warning(
+                "Apify request failed (%s): %s",
+                response.status_code,
+                str(provider_message)[:400],
+            )
+        else:
+            logger.warning("Apify request failed (%s)", response.status_code)
         raise HTTPException(
             502,
             f"Онлайн-collector вернул ошибку {response.status_code}.",
@@ -188,7 +205,6 @@ def _start_actor(actor: str, body: dict) -> dict:
         params={
             "timeout": APIFY_RUN_TIMEOUT,
             "memory": 256,
-            "maxItems": APIFY_PAGE_SIZE,
         },
         timeout=(10, 45),
     )
