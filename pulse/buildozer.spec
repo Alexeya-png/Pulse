@@ -18,7 +18,7 @@ android.archs = arm64-v8a
 android.allow_backup = False
 android.private_storage = True
 android.accept_sdk_license = True
-p4a.branch = v2026.05.09
+p4a.branch = develop
 
 [buildozer]
 log_level = 2
