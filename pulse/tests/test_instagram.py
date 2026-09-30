@@ -52,11 +52,11 @@ class ReaderTests(unittest.TestCase):
             InstagramReader(client).users("test", 2, "")
         self.assertNotIn("secret", str(raised.exception))
 
-    def test_likes_skipped_when_endpoint_truncated(self):
-        client = FakeClient([profile(1), ok(users=[user(1)]), ok(users=[]), profile(1), ok(items=[{"pk": 11}]), ok(items=[{"like_count": 2}]), ok(users=[user(1)])])
+    def test_likes_are_not_collected(self):
+        client = FakeClient([profile(1), ok(users=[user(1)]), ok(users=[]), profile(1)])
         result = InstagramReader(client).collect("owner")
-        self.assertEqual([s.kind for s in result.snapshot.samples], ["followers", "following"])
-        self.assertEqual(len(result.warnings), 1)
+        self.assertEqual([sample.kind for sample in result.snapshot.samples], ["followers", "following"])
+        self.assertEqual(result.warnings, ())
 
     def test_follower_count_changed_during_fetch(self):
         client = FakeClient([profile(1), ok(users=[user(1)]), ok(users=[]), profile(2)])
@@ -67,11 +67,6 @@ class ReaderTests(unittest.TestCase):
         client = FakeClient([profile(0), ok(users=[]), ok(users=[]), profile(0)])
         result = InstagramReader(client).collect("owner", recent_posts=0)
         self.assertEqual(result.snapshot.samples[0].members, ())
-
-    def test_complete_likers_included(self):
-        client = FakeClient([profile(1), ok(users=[user(1)]), ok(users=[]), profile(1), ok(items=[{"pk": 11}]), ok(items=[{"like_count": 1}]), ok(users=[user(2)]), ok(items=[{"like_count": 1}])])
-        result = InstagramReader(client).collect("owner")
-        self.assertEqual(result.snapshot.samples[2].members[0].user_id, "2")
 
     def test_cancellation_and_budget_make_no_requests(self):
         event = Event()
