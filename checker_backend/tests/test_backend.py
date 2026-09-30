@@ -56,6 +56,45 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["source"], "pulse-direct-fallback")
         direct.assert_called_once()
 
+    def test_local_direct_failure_uses_regional_relay(self):
+        snapshot = {
+            "account": "example",
+            "captured_at": "2026-09-30T00:00:00+00:00",
+            "followers_count": 1,
+            "following_count": 1,
+            "followers": [{"id": "1", "username": "alice"}],
+            "following": [{"id": "1", "username": "alice"}],
+            "complete": True,
+            "source": "pulse-regional-relay",
+        }
+        with patch.object(
+            main,
+            "_collect_profile_apify",
+            side_effect=HTTPException(503, "Apify unavailable"),
+        ), patch.object(
+            main,
+            "_checker_sessionid",
+            return_value="configured",
+        ), patch.object(
+            main,
+            "collect_direct_snapshot",
+            side_effect=HTTPException(503, "Render IP blocked"),
+        ), patch.object(
+            main,
+            "_collect_relay_snapshot",
+            return_value=snapshot,
+        ) as relay, patch.dict(
+            os.environ,
+            {
+                "IG_RELAY_URL": "https://relay.example",
+                "IG_RELAY_TOKEN": "relay-secret",
+            },
+        ):
+            response = self.client.post("/v1/collect", json={"username": "example"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["source"], "pulse-regional-relay")
+        relay.assert_called_once_with("example")
+
     def test_direct_session_uses_browser_headers_and_csrf(self):
         with patch.dict(
             os.environ,
