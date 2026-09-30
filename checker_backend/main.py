@@ -1,29 +1,33 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import re
-import subprocess
-import sys
 import threading
 import time
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Pulse Checker", version="0.4.0")
+from checker_backend.browser_runtime import browser_session, smoke_check
+
+
+@asynccontextmanager
+async def lifespan(app):
+    await asyncio.to_thread(smoke_check)
+    yield
+
+
+app = FastAPI(title="Pulse Checker", version="0.4.0", lifespan=lifespan)
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
-PLAYWRIGHT_BROWSERS_PATH = os.environ.setdefault(
-    "PLAYWRIGHT_BROWSERS_PATH", "/tmp/pulse-playwright"
-)
-
 _collect_lock = threading.Lock()
-_browser_lock = threading.Lock()
-_pw = None
-_browser = None
+logger = logging.getLogger("uvicorn.error")
 
 
 class CollectRequest(BaseModel):
@@ -73,69 +77,23 @@ def _session_cookies() -> list[dict]:
     return cookies
 
 
-def _ensure_browser():
-    global _pw, _browser
-    with _browser_lock:
-        if _browser is not None:
-            return _browser
-
-        from playwright.sync_api import sync_playwright
-
-        os.makedirs(PLAYWRIGHT_BROWSERS_PATH, exist_ok=True)
-
-        try:
-            _pw = sync_playwright().start()
-            _browser = _pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-            )
-            return _browser
-        except Exception as first_error:
-            if _pw is not None:
-                try:
-                    _pw.stop()
-                except Exception:
-                    pass
-                _pw = None
-
-            try:
-                subprocess.run(
-                    [sys.executable, "-m", "playwright", "install", "chromium"],
-                    check=True,
-                    timeout=240,
-                )
-                _pw = sync_playwright().start()
-                _browser = _pw.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                    ],
-                )
-                return _browser
-            except Exception as exc:
-                raise HTTPException(
-                    503,
-                    f"Не удалось запустить наш браузер collector: {exc.__class__.__name__}.",
-                ) from first_error
-
-
+@contextmanager
 def _make_page():
-    browser = _ensure_browser()
-    context = browser.new_context(
-        viewport={"width": 1280, "height": 900},
-        locale="en-US",
-        timezone_id="UTC",
-    )
-    context.add_cookies(_session_cookies())
-    page = context.new_page()
-    page.set_default_timeout(15000)
-    return context, page
+    # Validate the session before allocating a browser.
+    cookies = _session_cookies()
+    with browser_session() as browser:
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
+            timezone_id="UTC",
+        )
+        try:
+            context.add_cookies(cookies)
+            page = context.new_page()
+            page.set_default_timeout(15000)
+            yield context, page
+        finally:
+            context.close()
 
 
 def _assert_logged_in(page) -> None:
@@ -197,7 +155,7 @@ def _open_relation(page, target: str, kind: str):
 
 def _extract_usernames(dialog) -> dict[str, dict]:
     rows = dialog.evaluate(
-        """dialog => {
+        r"""dialog => {
             const out = [];
             for (const a of dialog.querySelectorAll('a[href]')) {
                 let path;
@@ -263,9 +221,7 @@ def _scroll_relation(dialog, expected: int | None, label: str) -> list[dict]:
 
 
 def _collect_profile(target: str) -> dict:
-    context = None
-    try:
-        context, page = _make_page()
+    with _make_page() as (context, page):
         _assert_logged_in(page)
 
         page.goto(
@@ -321,12 +277,6 @@ def _collect_profile(target: str) -> dict:
             "complete": True,
             "source": "pulse-web-collector",
         }
-    finally:
-        if context is not None:
-            try:
-                context.close()
-            except Exception:
-                pass
 
 
 @app.get("/health")
@@ -348,6 +298,15 @@ def collect(request: CollectRequest):
             "Сейчас уже выполняется другая проверка. Попробуйте позже.",
         )
     try:
-        return _collect_profile(target)
+        try:
+            return _collect_profile(target)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("Collector failed (%s)", exc.__class__.__name__)
+            raise HTTPException(
+                503,
+                f"Не удалось выполнить сбор нашим collector: {exc.__class__.__name__}.",
+            ) from exc
     finally:
         _collect_lock.release()

@@ -3,6 +3,7 @@ name: Android debug APK
 on:
   push:
     branches: [main]
+    paths: ['pulse/**', '.github/workflows/android.yml']
   workflow_dispatch:
 
 permissions:

@@ -1,0 +1,28 @@
+name: Backend headless shell
+
+on:
+  push:
+    branches: [main]
+    paths: ['checker_backend/**', 'render.yaml', '.github/workflows/backend.yml']
+  pull_request:
+    paths: ['checker_backend/**', 'render.yaml', '.github/workflows/backend.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install only headless shell and verify rendering
+        run: python -m checker_backend.build --with-deps
+      - name: Test API compatibility and browser cleanup
+        run: |
+          python -m pip install httpx==0.28.1
+          python -m unittest discover -s checker_backend/tests -v

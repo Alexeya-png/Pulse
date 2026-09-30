@@ -1,0 +1,16 @@
+# Match these settings on the existing pulse-checker service.
+services:
+  - type: web
+    name: pulse-checker
+    runtime: python
+    repo: https://github.com/Alexeya-png/Pulse
+    branch: main
+    region: frankfurt
+    plan: free
+    buildCommand: python -m checker_backend.build
+    startCommand: uvicorn checker_backend.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: IG_SESSION_JSON
+        sync: false
