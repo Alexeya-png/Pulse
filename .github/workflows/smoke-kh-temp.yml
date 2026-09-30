@@ -1,0 +1,55 @@
+name: kh.alexeya live smoke
+
+on:
+  push:
+    branches: ['smoke/kh-alexeya']
+    paths: ['.github/workflows/smoke-kh-temp.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 8
+    steps:
+      - name: Call live Pulse backend
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+
+          url = "https://pulse-checker-702b.onrender.com/v1/collect"
+          req = Request(
+              url,
+              data=json.dumps({"username":"kh.alexeya"}).encode(),
+              headers={
+                  "Content-Type":"application/json",
+                  "Accept":"application/json",
+                  "User-Agent":"Pulse-Live-Smoke/1.0",
+              },
+              method="POST",
+          )
+          try:
+              with urlopen(req, timeout=420) as r:
+                  payload = json.load(r)
+              print("STATUS", r.status)
+              print("account", payload.get("account"))
+              print("followers_count", payload.get("followers_count"))
+              print("following_count", payload.get("following_count"))
+              print("followers_len", len(payload.get("followers") or []))
+              print("following_len", len(payload.get("following") or []))
+              print("complete", payload.get("complete"))
+              print("source", payload.get("source"))
+              assert r.status == 200
+              assert payload["account"] == "kh.alexeya"
+              assert payload["followers_count"] == len(payload["followers"])
+              assert payload["following_count"] == len(payload["following"])
+              assert payload["complete"] is True
+          except HTTPError as e:
+              print("STATUS", e.code)
+              print(e.read().decode("utf-8","replace")[:12000])
+              raise
+          PY
