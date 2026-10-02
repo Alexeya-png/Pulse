@@ -167,6 +167,8 @@ def _check_response(response, *, authenticated: bool, target: str = "") -> str:
             "Instagram ограничил запросы collector.",
             retry_after_seconds(response.headers.get("Retry-After")),
         )
+    if authenticated and response.status_code == 401:
+        availability.stop("Instagram отклонил техническую сессию (401). Проверьте вход checker-аккаунта и обновите его сессию на сервере.", 300)
     if authenticated and kind in {"confirmation", "consent"}:
         availability.stop("Instagram требует подтверждения технического аккаунта. Откройте его в Instagram.", 300)
     return kind
@@ -180,6 +182,9 @@ def _fetch_once(
 ) -> tuple[int, dict | None]:
     _pace(deadline)
     remaining = _remaining(deadline)
+    # An unauthorized response can delete cookies from requests' jar. Record
+    # whether credentials were sent before processing response Set-Cookie.
+    authenticated = bool(session.cookies.get_dict().get("sessionid"))
     try:
         response = session.get(
             url,
@@ -190,7 +195,6 @@ def _fetch_once(
     except requests.RequestException:
         raise HTTPException(502, "Instagram временно недоступен для прямого collector.") from None
 
-    authenticated = bool(session.cookies.get_dict().get("sessionid"))
     kind = _check_response(response, authenticated=authenticated)
     if kind == "login":
         return 401, None

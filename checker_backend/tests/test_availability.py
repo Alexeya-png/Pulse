@@ -88,6 +88,26 @@ class AvailabilityTests(unittest.TestCase):
         self.assertIn("checker-сессию на вход", error.exception.detail)
         api.assert_not_called()
 
+    def test_unauthorized_response_clearing_cookies_is_still_session_failure(self):
+        state = Availability()
+        session = direct.requests.Session()
+        session.cookies.set("sessionid", "test-only", domain=".instagram.com")
+        response = MagicMock(status_code=401, url="https://i.instagram.com/api/v1/friendships/123/followers/", headers={})
+
+        def rejected(*args, **kwargs):
+            session.cookies.clear()
+            return response
+
+        with patch.object(direct, "availability", state), patch.object(direct, "_pace"), patch.object(session, "get", side_effect=rejected) as get, patch.object(direct, "_fallback_sessions") as alternatives:
+            with self.assertRaises(HTTPException) as error:
+                direct._json_get(session, response.url, None, time.monotonic() + 10)
+        session.close()
+        self.assertIn("401", error.exception.detail)
+        self.assertNotIn("test-only", error.exception.detail)
+        self.assertGreater(int(error.exception.headers["Retry-After"]), 0)
+        get.assert_called_once()
+        alternatives.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

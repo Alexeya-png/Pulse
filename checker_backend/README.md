@@ -37,8 +37,10 @@ pause is 15 minutes. During this pause, checks for every username return 503 wit
 a readable `detail` and `Retry-After`, without sending another Instagram request.
 The old two-second retry and transport switching after 429 have been removed.
 
-Authenticated confirmation/consent responses stop collection and explain that
-the technical account needs attention. When every checker profile-page response
+Authenticated HTTP 401 and confirmation/consent responses stop collection and
+explain that the technical account needs attention. Authentication is recorded
+before the response, since Instagram can clear the session cookie on rejection.
+When every checker profile-page response
 redirects to login, the error asks for the checker session to be checked. Those
 errors use a five-minute pause. This detects server access failures; it does not
 prove that the session has expired, or distinguish every IP restriction.
