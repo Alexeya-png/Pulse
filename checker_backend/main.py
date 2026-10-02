@@ -10,8 +10,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from checker_backend.direct_instagram import collect_direct_snapshot
+from checker_backend.availability import availability
 
-app = FastAPI(title="Pulse Checker", version="0.7.4")
+app = FastAPI(title="Pulse Checker", version="0.7.5")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 COLLECTION_TIMEOUT = max(30, min(210, int(os.environ.get("COLLECTION_TIMEOUT", "180"))))
@@ -48,6 +49,7 @@ def collect(request: CollectRequest):
         raise HTTPException(429, "Сейчас уже выполняется другая проверка. Попробуйте позже.")
     try:
         try:
+            availability.check()
             return collect_direct_snapshot(
                 target,
                 time.monotonic() + COLLECTION_TIMEOUT,

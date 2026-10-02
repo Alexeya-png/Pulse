@@ -7,6 +7,26 @@ from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
 
+def page_kind(url: str, target: str = "") -> str:
+    """Classify a redirect without recording URLs, query tokens or page text."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return "invalid"
+    if parsed.hostname not in {"instagram.com", "www.instagram.com", "i.instagram.com"}:
+        return "external"
+    path = parsed.path.lower()
+    if path.startswith(("/challenge", "/checkpoint", "/accounts/suspended", "/accounts/disabled")):
+        return "confirmation"
+    if path.startswith("/accounts/login"):
+        return "login"
+    if path.startswith(("/consent", "/privacy/consent")):
+        return "consent"
+    if target and path.rstrip("/") in {"/" + target, "/_u/" + target}:
+        return "profile"
+    return "other"
+
+
 def is_profile_url(url: str, target: str) -> bool:
     try:
         parsed = urlsplit(url)

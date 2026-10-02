@@ -9,10 +9,15 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from checker_backend import direct_instagram, main
+from checker_backend.availability import Availability
 
 
 class ApiTests(unittest.TestCase):
     def setUp(self):
+        self.availability = Availability()
+        patcher = patch.object(main, "availability", self.availability)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.client = TestClient(main.app)
 
     def test_health_is_direct_only(self):
@@ -92,6 +97,11 @@ class ApiTests(unittest.TestCase):
 
 
 class DirectInstagramTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(direct_instagram, "availability", Availability())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_direct_session_uses_browser_headers_and_csrf(self):
         with patch.dict(
             os.environ,
@@ -105,31 +115,31 @@ class DirectInstagramTests(unittest.TestCase):
         finally:
             session.close()
 
-    def test_direct_transport_switches_after_rate_limit(self):
+    def test_direct_transport_stops_after_rate_limit(self):
         primary = direct_instagram.requests.Session()
         alternative = direct_instagram.requests.Session()
         with patch.object(
             direct_instagram,
             "_fetch_once",
-            side_effect=[(429, None), (200, {"status": "ok"})],
-        ), patch.object(
+            return_value=(429, None),
+        ) as fetch, patch.object(
             direct_instagram,
             "_fallback_sessions",
             return_value=[("minimal-browser", alternative)],
-        ), patch.object(
-            direct_instagram,
-            "IG_429_RETRIES",
-            0,
-        ):
-            status, data = direct_instagram._json_get(
-                primary,
-                "https://www.instagram.com/api/v1/users/web_profile_info/",
-                {"username": "example"},
-                time.monotonic() + 10,
-            )
+        ) as alternatives:
+            with self.assertRaises(HTTPException) as error:
+                direct_instagram._json_get(
+                    primary,
+                    "https://www.instagram.com/api/v1/users/web_profile_info/",
+                    {"username": "example"},
+                    time.monotonic() + 10,
+                )
         primary.close()
-        self.assertEqual(status, 200)
-        self.assertEqual(data, {"status": "ok"})
+        alternative.close()
+        self.assertEqual(error.exception.status_code, 503)
+        self.assertGreater(int(error.exception.headers["Retry-After"]), 0)
+        fetch.assert_called_once()
+        alternatives.assert_not_called()
 
     def test_relationship_hosts_merge_unique_ids(self):
         session = direct_instagram.requests.Session()
@@ -156,6 +166,7 @@ class DirectInstagramTests(unittest.TestCase):
     def test_profile_page_counts_parse_exact_metadata(self):
         response = MagicMock()
         response.status_code = 200
+        response.url = "https://www.instagram.com/example/"
         response.text = '<meta content="142 Followers, 114 Following, 4 Posts">'
         session = direct_instagram.requests.Session()
         with patch.object(

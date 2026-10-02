@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from fastapi import HTTPException
 
 from checker_backend import direct_instagram as direct
+from checker_backend.availability import Availability
 from checker_backend.profile_page import parse_profile_page
 
 
@@ -77,6 +78,11 @@ class ProfilePageTests(unittest.TestCase):
 
 
 class PublicPageCollectionTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(direct, "availability", Availability())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_public_page_avoids_profile_api_and_checker_cookies(self):
         public = MagicMock()
         public.__enter__.return_value = public
@@ -97,6 +103,7 @@ class PublicPageCollectionTests(unittest.TestCase):
         public = MagicMock()
         public.__enter__.return_value = public
         public.get.return_value.status_code = 429
+        public.get.return_value.url = URL
         with patch.object(direct.requests, "Session", return_value=public), patch.object(direct, "_pace"), patch.object(direct, "_json_get") as api:
             with self.assertRaises(HTTPException) as error:
                 direct._profile(MagicMock(), "example", time.monotonic() + 10)

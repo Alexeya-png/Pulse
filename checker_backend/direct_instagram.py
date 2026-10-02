@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 import requests
 from fastapi import HTTPException
 
-from checker_backend.profile_page import is_profile_url, parse_profile_page
+from checker_backend.availability import availability, retry_after_seconds
+from checker_backend.profile_page import is_profile_url, page_kind, parse_profile_page
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -26,9 +27,6 @@ IG_APP_UA = os.environ.get(
     "Instagram 389.0.0.49.87 Android (34/14; 420dpi; 1080x2400; Google/google; Pixel 7; panther; panther; en_US; 699134704)",
 )
 IG_REQUEST_DELAY = max(0.0, float(os.environ.get("IG_DIRECT_REQUEST_DELAY", "0.8")))
-IG_429_RETRIES = max(0, int(os.environ.get("IG_DIRECT_429_RETRIES", "1")))
-IG_429_BACKOFF = max(0.5, float(os.environ.get("IG_DIRECT_429_BACKOFF", "2.0")))
-IG_MAX_RETRY_AFTER = max(1.0, float(os.environ.get("IG_DIRECT_MAX_RETRY_AFTER", "15")))
 PROFILE_URLS = (
     "https://www.instagram.com/api/v1/users/web_profile_info/",
     "https://i.instagram.com/api/v1/users/web_profile_info/",
@@ -149,6 +147,7 @@ def _fallback_sessions(source: requests.Session) -> list[tuple[str, requests.Ses
 
 def _pace(deadline: float) -> None:
     global _last_request_at
+    availability.check()
     if IG_REQUEST_DELAY <= 0:
         return
     with _pace_lock:
@@ -158,6 +157,19 @@ def _pace(deadline: float) -> None:
             time.sleep(min(wait, remaining))
         _remaining(deadline)
         _last_request_at = time.monotonic()
+
+
+def _check_response(response, *, authenticated: bool, target: str = "") -> str:
+    kind = page_kind(response.url, target)
+    logger.info("Instagram response classified (HTTP %d, page=%s, authenticated=%s)", response.status_code, kind, authenticated)
+    if response.status_code == 429:
+        availability.stop(
+            "Instagram ограничил запросы collector.",
+            retry_after_seconds(response.headers.get("Retry-After")),
+        )
+    if authenticated and kind in {"confirmation", "consent"}:
+        availability.stop("Instagram требует подтверждения технического аккаунта. Откройте его в Instagram.", 300)
+    return kind
 
 
 def _fetch_once(
@@ -178,16 +190,20 @@ def _fetch_once(
     except requests.RequestException:
         raise HTTPException(502, "Instagram временно недоступен для прямого collector.") from None
 
-    final_url = response.url.lower()
-    if "/challenge/" in final_url or "/checkpoint/" in final_url:
-        raise HTTPException(503, "Instagram просит подтвердить checker-аккаунт.")
-    if "/accounts/login" in final_url:
+    authenticated = bool(session.cookies.get_dict().get("sessionid"))
+    kind = _check_response(response, authenticated=authenticated)
+    if kind == "login":
         return 401, None
 
     try:
         data = response.json()
     except ValueError:
         data = None
+    if authenticated and isinstance(data, dict):
+        if data.get("message") in {"challenge_required", "checkpoint_required", "consent_required"}:
+            availability.stop("Instagram требует подтверждения технического аккаунта. Откройте его в Instagram.", 300)
+        if data.get("message") == "login_required":
+            return 401, None
     return response.status_code, data if isinstance(data, dict) else None
 
 
@@ -197,23 +213,11 @@ def _json_get(
     params: dict | None,
     deadline: float,
 ) -> tuple[int, dict | None]:
-    status = 503
-    data = None
-    for attempt in range(IG_429_RETRIES + 1):
-        status, data = _fetch_once(session, url, params, deadline)
-        if status != 429:
-            break
-        if attempt >= IG_429_RETRIES:
-            break
-        delay = min(
-            IG_429_BACKOFF * (2 ** attempt),
-            IG_MAX_RETRY_AFTER,
-            _remaining(deadline),
-        )
-        logger.warning("Direct Instagram transport rate-limited; retrying")
-        time.sleep(delay)
+    status, data = _fetch_once(session, url, params, deadline)
+    if status == 429:
+        availability.stop("Instagram ограничил запросы collector.", 900)
 
-    if status not in (401, 403, 429):
+    if status not in (401, 403):
         return status, data
 
     best_status, best_data = status, data
@@ -223,18 +227,16 @@ def _json_get(
         finally:
             alternative.close()
 
-        if alt_status not in (401, 403, 429):
+        if alt_status == 429:
+            availability.stop("Instagram ограничил запросы collector.", 900)
+
+        if alt_status not in (401, 403):
             logger.info(
                 "Direct Instagram transport recovered via %s (HTTP %d)",
                 name,
                 alt_status,
             )
             return alt_status, alt_data
-        if best_status == 429 and alt_status != 429:
-            best_status, best_data = alt_status, alt_data
-
-    if best_status == 429:
-        logger.warning("Direct Instagram endpoint rate-limited on all transports")
     return best_status, best_data
 
 def _as_int(value) -> int | None:
@@ -343,6 +345,7 @@ def _profile_page_counts(
     sessions: list[tuple[str, requests.Session]] = [("primary", session)]
     sessions.extend(_fallback_sessions(session))
     best_counts = (None, None)
+    page_kinds = []
     try:
         for name, candidate in sessions:
             if profile_out is not None and name == "anonymous-browser":
@@ -358,6 +361,8 @@ def _profile_page_counts(
                 )
             except requests.RequestException:
                 continue
+            kind = _check_response(response, authenticated=name != "anonymous-browser", target=target)
+            page_kinds.append(kind)
             if response.status_code != 200:
                 continue
 
@@ -369,8 +374,8 @@ def _profile_page_counts(
                     logger.info("Direct profile identity and exact counts resolved from page via %s", name)
                     return profile["followers_count"], profile["following_count"]
                 logger.info(
-                    "Profile page metadata incomplete via %s (target_url=%s, route_id=%s, canonical=%s)",
-                    name, is_profile_url(response.url, target),
+                    "Profile page metadata incomplete via %s (page=%s, target_url=%s, route_id=%s, canonical=%s)",
+                    name, kind, is_profile_url(response.url, target),
                     '"profile_id"' in text, 'rel="canonical"' in text,
                 )
                 if not is_profile_url(response.url, target):
@@ -412,6 +417,8 @@ def _profile_page_counts(
         for name, candidate in sessions:
             if name != "primary":
                 candidate.close()
+    if profile_out is not None and page_kinds and all(kind == "login" for kind in page_kinds):
+        availability.stop("Instagram перенаправляет checker-сессию на вход. Проверьте вход технического аккаунта и обновите его сессию на сервере.", 300)
     return best_counts
 
 
@@ -422,8 +429,7 @@ def _public_page_profile(target: str, deadline: float) -> dict | None:
     remaining = _remaining(deadline)
     with requests.Session() as public:
         public.headers.update({
-            "User-Agent": IG_BROWSER_UA,
-            "Accept": "text/html",
+            "User-Agent": "Mozilla/5.0",
             "Accept-Language": "en-US,en;q=0.9",
         })
         try:
@@ -434,8 +440,7 @@ def _public_page_profile(target: str, deadline: float) -> dict | None:
             )
         except requests.RequestException:
             return None
-        if response.status_code == 429:
-            raise HTTPException(503, "Instagram ограничил доступ к странице профиля. Попробуйте позже.")
+        kind = _check_response(response, authenticated=False, target=target)
         if response.status_code != 200:
             logger.info("Public profile page unavailable (HTTP %d)", response.status_code)
             return None
@@ -444,8 +449,8 @@ def _public_page_profile(target: str, deadline: float) -> dict | None:
             logger.info("Direct profile identity and exact counts resolved from public page")
         else:
             logger.info(
-                "Public profile page metadata incomplete (target_url=%s, route_id=%s, canonical=%s)",
-                is_profile_url(response.url, target),
+                "Public profile page metadata incomplete (page=%s, target_url=%s, route_id=%s, canonical=%s)",
+                kind, is_profile_url(response.url, target),
                 '"profile_id"' in response.text, 'rel="canonical"' in response.text,
             )
         return profile

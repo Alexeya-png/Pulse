@@ -16,7 +16,7 @@ user's Instagram session and is never sent to the phone.
 
 ## Profile lookup
 
-Backend 0.7.4 first reads the ordinary public profile page without checker cookies.
+Backend 0.7.5 first reads the ordinary public profile page without checker cookies.
 It extracts the displayed profile's numeric ID from page route data and exact
 followers/following counts from the page metadata. When these are available, the
 collector does not call profile API endpoints, including during the final recheck.
@@ -28,6 +28,25 @@ the existing checker-session page fallback also attempts to extract the identity
 before using profile APIs. Page lookup does not guarantee that
 Instagram will provide the relationship lists: those requests can still fail or
 return partial results. The existing completeness rules remain in force.
+
+## Access failures and backoff
+
+An Instagram HTTP 429 stops the active check immediately. The server respects
+`Retry-After` (seconds or HTTP date); when it is absent or invalid, the default
+pause is 15 minutes. During this pause, checks for every username return 503 with
+a readable `detail` and `Retry-After`, without sending another Instagram request.
+The old two-second retry and transport switching after 429 have been removed.
+
+Authenticated confirmation/consent responses stop collection and explain that
+the technical account needs attention. When every checker profile-page response
+redirects to login, the error asks for the checker session to be checked. Those
+errors use a five-minute pause. This detects server access failures; it does not
+prove that the session has expired, or distinguish every IP restriction.
+
+Diagnostics record only response status and fixed page categories, never full
+redirect URLs, query parameters, cookies or response bodies. The pause is shared
+in memory by the existing single-worker service; a process restart clears it.
+Successful response fields and snapshot completeness requirements are unchanged.
 
 ## Completeness rules
 
