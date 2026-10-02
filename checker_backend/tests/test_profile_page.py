@@ -105,12 +105,21 @@ class PublicPageCollectionTests(unittest.TestCase):
         api.assert_not_called()
 
     def test_unrecognized_page_retains_existing_profile_fallback(self):
-        with patch.object(direct, "_public_page_profile", return_value=None), patch.object(direct, "_json_get", return_value=(200, {"user": {
+        with patch.object(direct, "_public_page_profile", return_value=None), patch.object(direct, "_profile_page_counts", return_value=(None, None)), patch.object(direct, "_json_get", return_value=(200, {"user": {
             "id": "123", "username": "example", "follower_count": 2,
             "following_count": 1, "is_private": False,
         }})):
             result = direct._profile(MagicMock(), "example", time.monotonic() + 10)
         self.assertEqual(result["followers_count"], 2)
+
+    def test_checker_page_can_resolve_identity_without_profile_api(self):
+        checker = direct.requests.Session()
+        response = MagicMock(status_code=200, text=page(), url=URL)
+        with patch.object(direct, "_public_page_profile", return_value=None), patch.object(checker, "get", return_value=response), patch.object(direct, "_fallback_sessions", return_value=[]), patch.object(direct, "_pace"), patch.object(direct, "_json_get") as api:
+            result = direct._profile(checker, "example", time.monotonic() + 10)
+        checker.close()
+        self.assertEqual(result["id"], "123")
+        api.assert_not_called()
 
     def test_snapshot_still_rechecks_profile_and_uses_complete_followers(self):
         profile = parse_profile_page(page(description="2 Followers, 1 Following, 0 Posts"), "example", URL)

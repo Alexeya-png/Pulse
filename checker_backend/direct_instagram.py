@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import requests
 from fastapi import HTTPException
 
-from checker_backend.profile_page import parse_profile_page
+from checker_backend.profile_page import is_profile_url, parse_profile_page
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
@@ -336,12 +336,18 @@ def _profile_page_counts(
     session: requests.Session,
     target: str,
     deadline: float,
+    *,
+    profile_out: dict | None = None,
 ) -> tuple[int | None, int | None]:
     url = f"https://www.instagram.com/{target}/"
     sessions: list[tuple[str, requests.Session]] = [("primary", session)]
     sessions.extend(_fallback_sessions(session))
+    best_counts = (None, None)
     try:
         for name, candidate in sessions:
+            if profile_out is not None and name == "anonymous-browser":
+                # _profile already tried the public page without cookies.
+                continue
             _pace(deadline)
             remaining = _remaining(deadline)
             try:
@@ -356,6 +362,19 @@ def _profile_page_counts(
                 continue
 
             text = response.text
+            if profile_out is not None:
+                profile = parse_profile_page(text, target, response.url)
+                if profile:
+                    profile_out.update(profile)
+                    logger.info("Direct profile identity and exact counts resolved from page via %s", name)
+                    return profile["followers_count"], profile["following_count"]
+                logger.info(
+                    "Profile page metadata incomplete via %s (target_url=%s, route_id=%s, canonical=%s)",
+                    name, is_profile_url(response.url, target),
+                    '"profile_id"' in text, 'rel="canonical"' in text,
+                )
+                if not is_profile_url(response.url, target):
+                    continue
             patterns = (
                 (
                     r'"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
@@ -385,12 +404,15 @@ def _profile_page_counts(
                     following = _parse_exact_count(second.group(1))
                 if followers is not None and following is not None:
                     logger.info("Direct exact profile counts recovered from profile page via %s", name)
-                    return followers, following
+                    if profile_out is None:
+                        return followers, following
+                    best_counts = (followers, following)
+                    break
     finally:
         for name, candidate in sessions:
             if name != "primary":
                 candidate.close()
-    return None, None
+    return best_counts
 
 
 def _public_page_profile(target: str, deadline: float) -> dict | None:
@@ -415,10 +437,17 @@ def _public_page_profile(target: str, deadline: float) -> dict | None:
         if response.status_code == 429:
             raise HTTPException(503, "Instagram ограничил доступ к странице профиля. Попробуйте позже.")
         if response.status_code != 200:
+            logger.info("Public profile page unavailable (HTTP %d)", response.status_code)
             return None
         profile = parse_profile_page(response.text, target, response.url)
         if profile:
             logger.info("Direct profile identity and exact counts resolved from public page")
+        else:
+            logger.info(
+                "Public profile page metadata incomplete (target_url=%s, route_id=%s, canonical=%s)",
+                is_profile_url(response.url, target),
+                '"profile_id"' in response.text, 'rel="canonical"' in response.text,
+            )
         return profile
 
 
@@ -426,6 +455,12 @@ def _profile(session: requests.Session, target: str, deadline: float) -> dict:
     profile = _public_page_profile(target, deadline)
     if profile:
         return profile
+    page_profile: dict = {}
+    followers_count, following_count = _profile_page_counts(
+        session, target, deadline, profile_out=page_profile,
+    )
+    if page_profile:
+        return page_profile
     best = None
     saw_forbidden = False
     saw_not_found = False
@@ -462,7 +497,6 @@ def _profile(session: requests.Session, target: str, deadline: float) -> dict:
 
     # The public profile HTML often exposes exact small-account counts in
     # embedded JSON or OG metadata even when API endpoints return 429.
-    followers_count, following_count = _profile_page_counts(session, target, deadline)
     if best and followers_count is not None and following_count is not None:
         best["followers_count"] = followers_count
         best["following_count"] = following_count

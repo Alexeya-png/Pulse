@@ -23,8 +23,9 @@ collector does not call profile API endpoints, including during the final rechec
 The page URL and canonical metadata must match the requested username; ambiguous
 IDs, login redirects and abbreviated counts such as `1.2K` are rejected.
 
-A rate limit on the public page stops the check. A page that lacks usable metadata
-retains the existing profile API fallback. Page lookup does not guarantee that
+A rate limit on the public page stops the check. When its metadata is unavailable,
+the existing checker-session page fallback also attempts to extract the identity
+before using profile APIs. Page lookup does not guarantee that
 Instagram will provide the relationship lists: those requests can still fail or
 return partial results. The existing completeness rules remain in force.
 
