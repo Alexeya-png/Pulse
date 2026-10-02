@@ -14,6 +14,20 @@ It does not use HikerAPI, Apify, public Actors, or a paid scraping provider.
 The checker identity is infrastructure owned by the collector; it is not the Android
 user's Instagram session and is never sent to the phone.
 
+## Profile lookup
+
+Backend 0.7.4 first reads the ordinary public profile page without checker cookies.
+It extracts the displayed profile's numeric ID from page route data and exact
+followers/following counts from the page metadata. When these are available, the
+collector does not call profile API endpoints, including during the final recheck.
+The page URL and canonical metadata must match the requested username; ambiguous
+IDs, login redirects and abbreviated counts such as `1.2K` are rejected.
+
+A rate limit on the public page stops the check. A page that lacks usable metadata
+retains the existing profile API fallback. Page lookup does not guarantee that
+Instagram will provide the relationship lists: those requests can still fail or
+return partial results. The existing completeness rules remain in force.
+
 ## Completeness rules
 
 The profile counters are resolved before collection and rechecked afterwards.

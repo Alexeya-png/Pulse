@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 import requests
 from fastapi import HTTPException
 
+from checker_backend.profile_page import parse_profile_page
+
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 MAX_MEMBERS = int(os.environ.get("MAX_MEMBERS", "500000"))
 IG_WEB_APP_ID = "936619743392459"
@@ -391,7 +393,39 @@ def _profile_page_counts(
     return None, None
 
 
+def _public_page_profile(target: str, deadline: float) -> dict | None:
+    # A single ordinary public page request can provide both identity and exact
+    # counts. No checker cookies or authenticated API headers go into this request.
+    _pace(deadline)
+    remaining = _remaining(deadline)
+    with requests.Session() as public:
+        public.headers.update({
+            "User-Agent": IG_BROWSER_UA,
+            "Accept": "text/html",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        try:
+            response = public.get(
+                f"https://www.instagram.com/{target}/",
+                timeout=(min(8.0, remaining), min(30.0, remaining)),
+                allow_redirects=True,
+            )
+        except requests.RequestException:
+            return None
+        if response.status_code == 429:
+            raise HTTPException(503, "Instagram ограничил доступ к странице профиля. Попробуйте позже.")
+        if response.status_code != 200:
+            return None
+        profile = parse_profile_page(response.text, target, response.url)
+        if profile:
+            logger.info("Direct profile identity and exact counts resolved from public page")
+        return profile
+
+
 def _profile(session: requests.Session, target: str, deadline: float) -> dict:
+    profile = _public_page_profile(target, deadline)
+    if profile:
+        return profile
     best = None
     saw_forbidden = False
     saw_not_found = False
