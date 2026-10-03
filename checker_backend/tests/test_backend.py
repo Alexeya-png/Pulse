@@ -27,6 +27,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json(), {
             "ok": True,
             "engine": "pulse-direct-instagram",
+            "version": "0.7.6",
+            "http_transport": "requests",
             "session_configured": False,
             "third_party_scraper": False,
             "hiker_dependency": False,

@@ -80,6 +80,7 @@ class AvailabilityTests(unittest.TestCase):
     def test_all_checker_pages_redirecting_to_login_report_session(self):
         state = Availability()
         session = direct.requests.Session()
+        session.cookies.set("sessionid", "test-only", domain=".instagram.com")
         response = MagicMock(status_code=200, url="https://www.instagram.com/accounts/login/?next=secret", text="<html>Login</html>")
         with patch.object(direct, "availability", state), patch.object(direct, "_public_page_profile", return_value=None), patch.object(session, "get", return_value=response), patch.object(direct, "_fallback_sessions", return_value=[]), patch.object(direct, "_pace"), patch.object(direct, "_json_get") as api:
             with self.assertRaises(HTTPException) as error:

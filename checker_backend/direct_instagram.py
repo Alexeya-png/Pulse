@@ -12,6 +12,9 @@ import requests
 from fastapi import HTTPException
 
 from checker_backend.availability import availability, retry_after_seconds
+from checker_backend.http_transport import (
+    HttpSession, REQUEST_ERRORS, is_browser_session, new_session, session_transport,
+)
 from checker_backend.profile_page import is_profile_url, page_kind, parse_profile_page
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
@@ -101,8 +104,16 @@ def _session_headers(user_agent: str) -> dict[str, str]:
     }
 
 
+def _configure_session(session: HttpSession, user_agent: str) -> None:
+    headers = _session_headers(user_agent)
+    if is_browser_session(session):
+        # Do not overwrite the preset with an unrelated Chrome or Android UA.
+        headers.pop("User-Agent")
+    session.headers.update(headers)
+
+
 def _apply_cookies(
-    session: requests.Session,
+    session: HttpSession,
     data: dict[str, str],
     *,
     minimal: bool = False,
@@ -117,17 +128,19 @@ def _apply_cookies(
         session.headers["X-CSRFToken"] = csrf
 
 
-def _make_session(raw_session_json: str | None = None) -> requests.Session:
+def _make_session(raw_session_json: str | None = None) -> HttpSession:
     data = _session_data(raw_session_json)
-    session = requests.Session()
-    session.headers.update(_session_headers(IG_BROWSER_UA))
+    session = new_session()
+    _configure_session(session, IG_BROWSER_UA)
     _apply_cookies(session, data)
     return session
 
 
-def _fallback_sessions(source: requests.Session) -> list[tuple[str, requests.Session]]:
-    cookies = requests.utils.dict_from_cookiejar(source.cookies)
-    variants: list[tuple[str, requests.Session]] = []
+def _fallback_sessions(source: HttpSession) -> list[tuple[str, HttpSession]]:
+    if is_browser_session(source):
+        return []
+    cookies = source.cookies.get_dict()
+    variants: list[tuple[str, HttpSession]] = []
 
     minimal = requests.Session()
     minimal.headers.update(_session_headers(IG_BROWSER_UA))
@@ -169,13 +182,17 @@ def _check_response(response, *, authenticated: bool, target: str = "") -> str:
         )
     if authenticated and response.status_code == 401:
         availability.stop("Instagram отклонил техническую сессию (401). Проверьте вход checker-аккаунта и обновите его сессию на сервере.", 300)
+    if authenticated and response.status_code == 403:
+        availability.stop("Instagram запретил запрос технической сессии (403). Проверка остановлена; проверьте технический аккаунт в Instagram.", 900)
     if authenticated and kind in {"confirmation", "consent"}:
         availability.stop("Instagram требует подтверждения технического аккаунта. Откройте его в Instagram.", 300)
+    if authenticated and kind == "login":
+        availability.stop("Instagram перенаправляет checker-сессию на вход. Проверьте вход технического аккаунта и обновите его сессию на сервере.", 300)
     return kind
 
 
 def _fetch_once(
-    session: requests.Session,
+    session: HttpSession,
     url: str,
     params: dict | None,
     deadline: float,
@@ -192,7 +209,7 @@ def _fetch_once(
             timeout=(min(8.0, remaining), min(30.0, remaining)),
             allow_redirects=True,
         )
-    except requests.RequestException:
+    except REQUEST_ERRORS:
         raise HTTPException(502, "Instagram временно недоступен для прямого collector.") from None
 
     kind = _check_response(response, authenticated=authenticated)
@@ -207,12 +224,14 @@ def _fetch_once(
         if data.get("message") in {"challenge_required", "checkpoint_required", "consent_required"}:
             availability.stop("Instagram требует подтверждения технического аккаунта. Откройте его в Instagram.", 300)
         if data.get("message") == "login_required":
-            return 401, None
+            availability.stop("Instagram отклонил техническую сессию (login_required). Проверьте вход checker-аккаунта и обновите его сессию на сервере.", 300)
+        if data.get("message") == "feedback_required" or data.get("feedback_required"):
+            availability.stop("Instagram ограничил действия технического аккаунта (feedback_required). Проверка остановлена.", 900)
     return response.status_code, data if isinstance(data, dict) else None
 
 
 def _json_get(
-    session: requests.Session,
+    session: HttpSession,
     url: str,
     params: dict | None,
     deadline: float,
@@ -299,7 +318,7 @@ def _extract_profile(data: dict | None, target: str) -> dict | None:
     return None
 
 
-def _user_info(session: requests.Session, user_id: str, target: str, deadline: float) -> dict | None:
+def _user_info(session: HttpSession, user_id: str, target: str, deadline: float) -> dict | None:
     status, data = _json_get(
         session,
         f"https://i.instagram.com/api/v1/users/{user_id}/info/",
@@ -312,7 +331,7 @@ def _user_info(session: requests.Session, user_id: str, target: str, deadline: f
     return _profile_from_user(user, target)
 
 
-def _search_profile(session: requests.Session, target: str, deadline: float) -> dict | None:
+def _search_profile(session: HttpSession, target: str, deadline: float) -> dict | None:
     status, data = _json_get(
         session,
         "https://www.instagram.com/api/v1/web/search/topsearch/",
@@ -339,14 +358,14 @@ def _parse_exact_count(value: str) -> int | None:
 
 
 def _profile_page_counts(
-    session: requests.Session,
+    session: HttpSession,
     target: str,
     deadline: float,
     *,
     profile_out: dict | None = None,
 ) -> tuple[int | None, int | None]:
     url = f"https://www.instagram.com/{target}/"
-    sessions: list[tuple[str, requests.Session]] = [("primary", session)]
+    sessions: list[tuple[str, HttpSession]] = [("primary", session)]
     sessions.extend(_fallback_sessions(session))
     best_counts = (None, None)
     page_kinds = []
@@ -357,15 +376,16 @@ def _profile_page_counts(
                 continue
             _pace(deadline)
             remaining = _remaining(deadline)
+            authenticated = bool(candidate.cookies.get_dict().get("sessionid"))
             try:
                 response = candidate.get(
                     url,
                     timeout=(min(8.0, remaining), min(30.0, remaining)),
                     allow_redirects=True,
                 )
-            except requests.RequestException:
+            except REQUEST_ERRORS:
                 continue
-            kind = _check_response(response, authenticated=name != "anonymous-browser", target=target)
+            kind = _check_response(response, authenticated=authenticated, target=target)
             page_kinds.append(kind)
             if response.status_code != 200:
                 continue
@@ -431,18 +451,17 @@ def _public_page_profile(target: str, deadline: float) -> dict | None:
     # counts. No checker cookies or authenticated API headers go into this request.
     _pace(deadline)
     remaining = _remaining(deadline)
-    with requests.Session() as public:
-        public.headers.update({
-            "User-Agent": "Mozilla/5.0",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
+    with new_session() as public:
+        public.headers.update({"Accept-Language": "en-US,en;q=0.9"})
+        if not is_browser_session(public):
+            public.headers["User-Agent"] = "Mozilla/5.0"
         try:
             response = public.get(
                 f"https://www.instagram.com/{target}/",
                 timeout=(min(8.0, remaining), min(30.0, remaining)),
                 allow_redirects=True,
             )
-        except requests.RequestException:
+        except REQUEST_ERRORS:
             return None
         kind = _check_response(response, authenticated=False, target=target)
         if response.status_code != 200:
@@ -460,7 +479,7 @@ def _public_page_profile(target: str, deadline: float) -> dict | None:
         return profile
 
 
-def _profile(session: requests.Session, target: str, deadline: float) -> dict:
+def _profile(session: HttpSession, target: str, deadline: float) -> dict:
     profile = _public_page_profile(target, deadline)
     if profile:
         return profile
@@ -531,10 +550,12 @@ def _member(row: dict) -> dict:
 
 
 def _relationship_sessions(
-    source: requests.Session,
-) -> list[tuple[str, requests.Session, bool]]:
-    cookies = requests.utils.dict_from_cookiejar(source.cookies)
-    variants: list[tuple[str, requests.Session, bool]] = [
+    source: HttpSession,
+) -> list[tuple[str, HttpSession, bool]]:
+    if is_browser_session(source):
+        return [("primary-browser", source, False)]
+    cookies = source.cookies.get_dict()
+    variants: list[tuple[str, HttpSession, bool]] = [
         ("primary-browser", source, False),
     ]
 
@@ -551,7 +572,7 @@ def _relationship_sessions(
 
 
 def _relation_page_from_base(
-    session: requests.Session,
+    session: HttpSession,
     base: str,
     user_id: str,
     kind: str,
@@ -584,7 +605,7 @@ def _relation_page_from_base(
 
 
 def _collect_pages(
-    session: requests.Session,
+    session: HttpSession,
     user_id: str,
     kind: str,
     expected: int,
@@ -603,7 +624,7 @@ def _collect_pages(
     # hosts and pagination parameters can expose different slices. Merge all
     # observed rows by immutable numeric ID and only accept the exact count.
     found: dict[str, dict] = {}
-    cookie_map = requests.utils.dict_from_cookiejar(session.cookies)
+    cookie_map = session.cookies.get_dict()
     has_authenticated_session = bool(cookie_map.get("sessionid"))
     transport_sessions = (
         _relationship_sessions(session)
@@ -709,6 +730,7 @@ def collect_direct_snapshot(
     session_json: str | None = None,
 ) -> dict:
     with _make_session(session_json) as session:
+        logger.info("Direct collector transport selected (%s)", session_transport(session))
         before = _profile(session, target, deadline)
         if before["is_private"]:
             raise HTTPException(403, "Онлайн-режим поддерживает только публичные Instagram-аккаунты.")

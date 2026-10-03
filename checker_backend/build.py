@@ -21,7 +21,7 @@ def main() -> None:
         [
             sys.executable,
             "-c",
-            "import fastapi, requests, uvicorn; print('Online collector build check passed.')",
+            "import fastapi, requests, uvicorn, curl_cffi; print('Online collector build check passed.')",
         ],
         check=True,
     )

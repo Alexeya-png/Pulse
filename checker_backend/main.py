@@ -11,8 +11,9 @@ from pydantic import BaseModel
 
 from checker_backend.direct_instagram import collect_direct_snapshot
 from checker_backend.availability import availability
+from checker_backend.http_transport import configured_transport
 
-app = FastAPI(title="Pulse Checker", version="0.7.5")
+app = FastAPI(title="Pulse Checker", version="0.7.6")
 
 USERNAME_RE = re.compile(r"^[a-z0-9_.]{1,30}$")
 COLLECTION_TIMEOUT = max(30, min(210, int(os.environ.get("COLLECTION_TIMEOUT", "180"))))
@@ -36,6 +37,8 @@ def health():
     return {
         "ok": True,
         "engine": "pulse-direct-instagram",
+        "version": app.version,
+        "http_transport": configured_transport(),
         "session_configured": bool(os.environ.get("IG_SESSION_JSON", "").strip()),
         "third_party_scraper": False,
         "hiker_dependency": False,

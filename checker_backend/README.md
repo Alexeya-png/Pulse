@@ -10,13 +10,16 @@ It does not use HikerAPI, Apify, public Actors, or a paid scraping provider.
 
 - `IG_SESSION_JSON`: technical checker-session cookies kept only on Render.
 - `COLLECTION_TIMEOUT`: optional timeout.
+- `IG_HTTP_TRANSPORT`: `requests` (default) or `curl_cffi` for a controlled
+  browser-transport compatibility check. The latter uses pinned Chrome 136
+  headers, TLS and HTTP/2 settings; it does not run JavaScript or repair a session.
 
 The checker identity is infrastructure owned by the collector; it is not the Android
 user's Instagram session and is never sent to the phone.
 
 ## Profile lookup
 
-Backend 0.7.5 first reads the ordinary public profile page without checker cookies.
+Backend 0.7.6 first reads the ordinary public profile page without checker cookies.
 It extracts the displayed profile's numeric ID from page route data and exact
 followers/following counts from the page metadata. When these are available, the
 collector does not call profile API endpoints, including during the final recheck.
@@ -42,13 +45,34 @@ explain that the technical account needs attention. Authentication is recorded
 before the response, since Instagram can clear the session cookie on rejection.
 When every checker profile-page response
 redirects to login, the error asks for the checker session to be checked. Those
-errors use a five-minute pause. This detects server access failures; it does not
+errors use a five-minute pause. Authenticated HTTP 403 and `feedback_required`
+stop after the first response with a fifteen-minute pause. JSON `login_required`
+and authenticated login redirects also stop immediately. This detects server access failures; it does not
 prove that the session has expired, or distinguish every IP restriction.
 
 Diagnostics record only response status and fixed page categories, never full
 redirect URLs, query parameters, cookies or response bodies. The pause is shared
 in memory by the existing single-worker service; a process restart clears it.
 Successful response fields and snapshot completeness requirements are unchanged.
+
+## Browser transport experiment
+
+`curl_cffi==0.16.3` with preset `chrome136` is selected before collection for both
+anonymous profile lookup and authenticated requests. Its own browser headers are
+preserved instead of overriding them with the legacy Chrome 140 or Android UA.
+In this mode, cookie/header identity variants are disabled and network retry is
+zero. Access failures never cause a switch to `requests` or another identity.
+`/health` reports `version` and `http_transport`; it does not test session validity.
+
+Enable `IG_HTTP_TRANSPORT=curl_cffi` on the existing Render service, deploy, and
+perform one ordinary `/v1/collect` check. Compare only response categories and
+counts in logs. If authenticated requests still return 401, the transport change
+has not resolved access: the technical-account owner must check the same account
+in the official Instagram browser session. A browser success and server failure
+would help isolate environment or endpoint differences; neither proves the exact
+reason for an Instagram restriction. Never put session cookies in a public
+diagnostic route, repository, logs or phone payload. Set the variable back to
+`requests` to revert the transport without changing APK data or response fields.
 
 ## Completeness rules
 
